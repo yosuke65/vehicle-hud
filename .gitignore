@@ -1,0 +1,14 @@
+*.iml
+.gradle/
+.idea/
+.cxx/
+/local.properties
+/captures
+.externalNativeBuild/
+build/
+app/build/
+.DS_Store
+
+# Read-only sparse checkout of the real AOSP source, cloned for Phase 2
+# research (see docs/AOSP_VHAL_NOTES.md) — not part of this project.
+/reference/
