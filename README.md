@@ -69,7 +69,7 @@ go further."*
 
 ## Talking points for the interview
 
-Seven genuine, specific stories from this project, not generic claims:
+Eight genuine, specific stories from this project, not generic claims:
 
 1. **A real bug, found by reading a stack trace, not guessing.** The AIDL
    binder's first implementation — `override fun getSpeedKph(): Float =
@@ -148,6 +148,20 @@ Seven genuine, specific stories from this project, not generic claims:
    afterward with real Unity log output (`Scripting Backend 'il2cpp'`,
    real device model, `Fully drawn`) and two screenshots proving the cube
    is actually rotating, not frozen.
+8. **Knowing when to stop, and why that's the more honest answer.**
+   Attempted genuine same-screen Unity+native compositing (Unity as the
+   background, the native needle as an inset overlay, one shared telemetry
+   value driving both). Verified the API supported it via `javap` on the
+   real compiled classes, not assumption; hit and fixed two real Gradle
+   visibility/path issues; then hit a genuine architectural wall —
+   `UnityPlayerForGameActivity`'s native startup silently depends on
+   `GameActivity`'s own native event glue, which never runs unless the
+   host Activity actually extends `GameActivity`. Diagnosed methodically
+   (`dumpsys` view hierarchy, timed waits to rule out a slow cold start,
+   confirmed the main thread wasn't blocked) rather than guessed, then
+   reverted cleanly back to the working Phase 4 state the moment the
+   evidence was clear, instead of continuing to poke at decreasing odds.
+   Full root-cause writeup in the Phase 5 log entry below.
 
 ## Day-by-day log
 
@@ -415,6 +429,66 @@ Seven genuine, specific stories from this project, not generic claims:
   intercepts the back gesture itself (likely for in-game menu handling),
   so returning to `MainActivity` currently needs a fresh launch rather than
   back-navigation. Noted, not papered over.
+
+- **Phase 5 (attempted, real architectural wall found, reverted honestly)
+  — genuine same-screen Unity + native compositing.** Went further than
+  Phase 4's separate-Activity launch: tried constructing Unity's player
+  directly inside `MainActivity` itself, so the Unity 3D scene would
+  render as a full-screen background with the native GLES needle
+  composited on top as a smaller inset, both driven by the same live
+  telemetry (`UnitySendMessage` feeding the cube's rotation speed from the
+  same AIDL poll loop that drives the needle).
+
+  **Feasibility genuinely verified first, not assumed:** decompiled the
+  real `unity-classes.jar` (`javap -classpath . com.unity3d.player.X`) and
+  confirmed `UnityPlayerForGameActivity`'s constructor takes a plain
+  `android.app.Activity`, not specifically a `GameActivity` — same-Activity
+  embedding looked genuinely possible at the API level, not a guess.
+
+  **Built it, hit two real, fixable Gradle issues first:**
+  1. `unity-classes.jar` is only an `implementation` dependency *inside*
+     `unityLibrary`, invisible to `:app`'s compile classpath even though
+     it's in the final APK at runtime — fixed with a direct `compileOnly`
+     dependency in `app/build.gradle.kts` pointing at the same jar.
+  2. A relative-path depth bug in that fix (`app/build.gradle.kts`
+     resolves relative paths from `vehicle-hud/app/`, not `vehicle-hud/`,
+     unlike `settings.gradle.kts`) — needed one more `../`.
+
+  **Then hit a real architectural wall, not a wiring bug.** After fixing
+  both Gradle issues, the app built and ran with zero crashes — but
+  Unity's background never rendered. Diagnosed methodically, not guessed:
+  `adb shell dumpsys activity` showed the container `FrameLayout` had zero
+  children (the constructor doesn't auto-attach the `SurfaceView` the way
+  `GameActivity`'s own framework does — fixed by attaching it manually);
+  after that fix, the view hierarchy was correct, but Unity's log still
+  stopped dead after exactly one line (`IL2CPP: JNI_OnLoad` →
+  `Unity: Context Type: GameActivity` → nothing), with the Activity itself
+  healthy (`mResumed=true`, no ANR — the main thread wasn't blocked, so
+  something in Unity's own internal thread was). Waited 15+ extra seconds
+  to rule out a slow cold start — no change. Conclusion: `UnityPlayerFor
+  GameActivity`'s constructor is Activity-agnostic *at the API surface*
+  (confirmed by `javap`), but its native startup isn't actually
+  host-agnostic at runtime — it appears to depend on `GameActivity`'s own
+  native event glue (the C++ side of `com.google.androidgamesdk
+  .GameActivity`, which normally pumps `APP_CMD_INIT_WINDOW`-style events
+  into Unity's engine), which never initializes unless the host Activity
+  genuinely *extends* `GameActivity`. `MainActivity` extends plain
+  `ComponentActivity`, so that glue never runs, and Unity's render thread
+  waits on a signal that never arrives.
+
+  **Reverted cleanly, not left half-broken:** `git checkout` back to the
+  Phase 4 commit for `MainActivity.kt`/`app/build.gradle.kts`, deleted the
+  new `EmbeddedUnityView.kt` — the app is back to Phase 4's verified,
+  working separate-Activity Unity launch. This finding is documented here
+  instead of hidden specifically *because* it's good material: verifying
+  an API surface with real tooling (`javap`, not assumption) instead of
+  trusting documentation, methodically diagnosing a silent runtime stall
+  with the actual tools (`dumpsys`, live view hierarchy, timed waits to
+  rule out "just slow") rather than guessing, and reverting cleanly the
+  moment the evidence pointed at a real architectural constraint rather
+  than continuing to poke at decreasing odds — that whole process is a
+  more honest answer to "tell me about Unity as a Library" than a cube
+  that happens to render would have been on its own.
 
 ## Build
 
