@@ -1,6 +1,8 @@
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
+    // AGP 9's Kotlin support is now built in — applying the separate
+    // org.jetbrains.kotlin.android plugin alongside it is a hard error
+    // ("no longer required for Kotlin support since AGP 9.0").
 }
 
 android {
@@ -10,7 +12,10 @@ android {
 
     defaultConfig {
         applicationId = "dev.yosukesakurai.vehiclehud"
-        minSdk = 24
+        // Bumped from 24: Unity 6's exported unityLibrary (Phase 4, UAAL)
+        // hard-requires minSdk 26 — its own build.gradle sets minSdk 26
+        // directly, and a lower value here would conflict at merge time.
+        minSdk = 26
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
@@ -51,6 +56,9 @@ android {
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity)
+    // Phase 4 (UAAL): the Unity-exported Gradle library module, referenced
+    // in place from ../vehicle-hud-unity (see settings.gradle.kts).
+    implementation(project(":unityLibrary"))
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

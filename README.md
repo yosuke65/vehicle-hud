@@ -47,11 +47,13 @@ Four threads, one process boundary:
 - **UI thread**: only owns the `ServiceConnection` callback and Activity
   lifecycle; never touches EGL, GL, or the telemetry mutex directly.
 
-A completely separate, isolated system exists alongside all of this:
+Two more systems exist alongside all of this, both reachable from the HUD:
 **`VulkanActivity`/`VulkanRenderer`** (Phase 3, own render thread, own
-teardown discipline, zero shared state with the diagram above) — reachable
-by tapping the HUD. Kept deliberately separate so a Vulkan mistake could
-never touch the working system described here.
+teardown discipline, zero shared state with the diagram above) via tap,
+kept deliberately separate so a Vulkan mistake could never touch the
+working system described here; and **Unity's own
+`UnityPlayerGameActivity`** (Phase 4, UAAL — a real `unityLibrary` Gradle
+module merged into this same app, not this project's code) via long-press.
 
 ## What this demonstrates, and what it honestly doesn't (AOSP scope)
 
@@ -67,7 +69,7 @@ go further."*
 
 ## Talking points for the interview
 
-Six genuine, specific stories from this project, not generic claims:
+Seven genuine, specific stories from this project, not generic claims:
 
 1. **A real bug, found by reading a stack trace, not guessing.** The AIDL
    binder's first implementation — `override fun getSpeedKph(): Float =
@@ -130,6 +132,22 @@ Six genuine, specific stories from this project, not generic claims:
    behind an implicit state machine; Vulkan makes every sync point an
    object you create yourself — more code, but the explicit control the JD
    frames as the point of using it on resource-constrained hardware.
+7. **Unity as a Library, merged into a real APK, with a real toolchain wall
+   hit and cleared.** Exported a Unity 6 IL2CPP project as a Gradle library
+   and merged it directly into this app — confirmed by inspecting the
+   built APK's `lib/arm64-v8a/` and finding `libunity.so`/`libil2cpp.so`
+   sitting next to this project's own native libraries, not just a
+   passing build log. Doing that required a major AGP 8→9 / Gradle 8→9
+   migration (Unity's hard requirement), taken seriously: checked AGP
+   9.0.0 was a real published version before committing to it, `git
+   init`'d the project and committed a known-good checkpoint *before*
+   attempting the risky bump, then hit and fixed four distinct real
+   breaking changes in order (AGP 9's built-in Kotlin conflicting with the
+   old plugin, missing Unity-specific Gradle properties, a missing
+   plugin-classpath declaration, a minSdk floor bump) — verified on-device
+   afterward with real Unity log output (`Scripting Backend 'il2cpp'`,
+   real device model, `Fully drawn`) and two screenshots proving the cube
+   is actually rotating, not frozen.
 
 ## Day-by-day log
 
@@ -333,6 +351,70 @@ Six genuine, specific stories from this project, not generic claims:
   "just works" that gives you less control on resource-constrained
   hardware. That tradeoff, not the triangle itself, is the actual talking
   point.
+
+- **Phase 4 (done, verified on-device) — Unity as a Library (UAAL), for
+  real.** The single most literally-named technology in the JD's first
+  bullet, and the highest-risk phase. A separate `vehicle-hud-unity` Unity
+  6000.5.9f1 project (rotating cube, IL2CPP scripting backend) was exported
+  as an Android Gradle library (`unityLibrary`) and merged directly into
+  this app — one real APK containing both `libvehiclehud.so` (this
+  project's own EGL/Vulkan/AIDL native code) and Unity's own
+  `libunity.so`/`libil2cpp.so`/`libgame.so`, confirmed by inspecting the
+  built APK's `lib/arm64-v8a/` contents directly, not just a green build
+  log. Reachable in-app via long-press on the HUD (tap still opens the
+  Vulkan triangle from Phase 3); launches Unity's own
+  `UnityPlayerGameActivity` by explicit component name, since that
+  Activity is declared in `unityLibrary`'s manifest, not one this project
+  owns.
+
+  **The real wall this phase hit:** Unity 6000.5.9f1's export requires
+  **AGP 9.0.0 / Gradle 9.1.0** — a major-version jump from this project's
+  AGP 8.13.0 / Gradle 8.13, and only one AGP/Gradle version can apply to a
+  single Gradle build. Verified AGP 9.0.0 was a real, published, stable
+  version (not asking for something broken) before deciding whether to
+  attempt the migration. Given the risk to the four already-verified
+  phases, `git init`'d this project and committed the known-good state
+  first as an explicit rollback point *before* attempting the bump — the
+  kind of safety net a risky migration should have, not an afterthought.
+
+  **What actually broke, in order, each with a real fix:**
+  1. AGP 9's Kotlin support is now built in; applying the separate
+     `org.jetbrains.kotlin.android` plugin alongside it is a hard error
+     ("no longer required for Kotlin support since AGP 9.0"). Fixed by
+     removing that plugin from `app/build.gradle.kts` and letting AGP 9
+     handle Kotlin natively.
+  2. `unityLibrary/build.gradle` reads several properties
+     (`unityStreamingAssets`, `unity.androidSdkPath`,
+     `unity.androidNdkPath`, `unity.androidNdkVersion`,
+     `unity.installInBuildFolder`) that only existed in *Unity's own*
+     exported `gradle.properties`, not this project's. Merged the ones
+     `unityLibrary`'s build script actually references into this
+     project's `gradle.properties` — deliberately **not** copying
+     `android.builtInKotlin=false`, since Unity sets that because
+     `unityLibrary` has zero Kotlin sources, but this app's own `:app`
+     module now depends on AGP 9's built-in Kotlin support (see fix #1) —
+     copying it blind would have broken the module that actually needs it.
+  3. `com.android.library` had no plugin-classpath declaration anywhere in
+     this project (it only ever declared `com.android.application`) —
+     `unityLibrary` needs it. Added `android-library` to
+     `gradle/libs.versions.toml` and applied it (`apply false`) at the
+     root `build.gradle.kts`.
+  4. Unity 6's minimum supported `minSdk` is 26; `unityLibrary`'s own
+     `build.gradle` hard-sets `minSdk 26`. Bumped this app's `minSdk` from
+     24 to 26 to match — flagged during Phase 4 planning (a Unity API
+     obsolescence warning caught while writing the export script), fixed
+     for real here.
+
+  **Verified on-device, not just compiled:** installed, long-pressed the
+  HUD, and logcat showed the real thing — `Scripting Backend 'il2cpp'`,
+  `Device Model 'Google Pixel 6a'`, `Fully drawn ... +622ms`, zero crashes.
+  Two screenshots two seconds apart differ, confirming the cube is
+  genuinely rotating (`RotateCube.cs`'s `Update()` running), not a frozen
+  first frame. One more honest finding, not fixed: pressing back doesn't
+  exit Unity's activity back to the native HUD — `UnityPlayerGameActivity`
+  intercepts the back gesture itself (likely for in-game menu handling),
+  so returning to `MainActivity` currently needs a fresh launch rather than
+  back-navigation. Noted, not papered over.
 
 ## Build
 

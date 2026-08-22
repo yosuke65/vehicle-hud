@@ -36,12 +36,20 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         hudView = HudSurfaceView(this)
         // Phase 3: tap the HUD to open the separate Vulkan triangle
-        // activity. No layout XML in this project, so a click listener on
-        // the existing view is the minimal way to add a second entry
-        // point rather than introducing a new UI framework just for this.
+        // activity. Phase 4: long-press to open the embedded Unity view
+        // (UAAL) instead — explicit component name, since
+        // UnityPlayerGameActivity is declared in unityLibrary's own
+        // manifest, not one this project owns. No layout XML in this
+        // project, so click listeners on the existing view are the
+        // minimal way to add entry points rather than introducing a new
+        // UI framework just for this.
         hudView.isClickable = true
         hudView.setOnClickListener {
             startActivity(Intent(this, VulkanActivity::class.java))
+        }
+        hudView.setOnLongClickListener {
+            startActivity(Intent().setClassName(this, "com.unity3d.player.UnityPlayerGameActivity"))
+            true
         }
         setContentView(hudView)
     }
