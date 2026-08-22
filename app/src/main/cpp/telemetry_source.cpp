@@ -1,12 +1,21 @@
 #include "telemetry_source.h"
 
-#include <android/log.h>
-
 #include <chrono>
 #include <cmath>
 
+// This file is compiled two ways: normally via the app's NDK/CMake build
+// (__ANDROID__ defined by the toolchain), and standalone by
+// native_tests/CMakeLists.txt on the host, with GoogleTest and (optionally)
+// ThreadSanitizer, to test the mutex-guarded handoff logic directly against
+// this exact production source rather than a reimplementation. Only the
+// logging call differs between the two.
+#if defined(__ANDROID__)
+#include <android/log.h>
 #define LOG_TAG "VehicleHud"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGI(...) ((void)0)
+#endif
 
 namespace {
 constexpr float kMaxSpeedKph = 180.0f;

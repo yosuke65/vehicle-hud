@@ -69,7 +69,7 @@ go further."*
 
 ## Talking points for the interview
 
-Eight genuine, specific stories from this project, not generic claims:
+Nine genuine, specific stories from this project, not generic claims:
 
 1. **A real bug, found by reading a stack trace, not guessing.** The AIDL
    binder's first implementation — `override fun getSpeedKph(): Float =
@@ -162,6 +162,14 @@ Eight genuine, specific stories from this project, not generic claims:
    reverted cleanly back to the working Phase 4 state the moment the
    evidence was clear, instead of continuing to poke at decreasing odds.
    Full root-cause writeup in the Phase 5 log entry below.
+9. **Real concurrency tests, not just working code.** The JD's one clean
+   gap — "automated testing" — closed cheaply and honestly: three tests
+   against the *actual* `TelemetrySource` production source (compiled
+   directly, not reimplemented), covering the property that actually
+   matters — that the internal/external telemetry handoff never produces
+   a torn read under real concurrent pressure (4 writers + 1 reader, a
+   deterministic invariant that a broken mutex would violate). Clean under
+   ThreadSanitizer, not just passing by luck.
 
 ## Day-by-day log
 
@@ -489,6 +497,42 @@ Eight genuine, specific stories from this project, not generic claims:
   than continuing to poke at decreasing odds — that whole process is a
   more honest answer to "tell me about Unity as a Library" than a cube
   that happens to render would have been on its own.
+
+- **Phase 6 (done) — targeted concurrency tests for `TelemetrySource`.**
+  The JD explicitly lists "automated testing," and until this phase the
+  project had zero — a real, cheap gap to close, unlike the hardware ones.
+  Rather than blanket coverage everywhere, tested the one place
+  concurrency correctness actually matters: `TelemetrySource`'s
+  mutex-guarded internal/external handoff. `native_tests/telemetry_source_test.cpp`
+  compiles the **actual production** `telemetry_source.cpp` directly (not
+  a reimplementation) as a standalone host binary — no test-framework
+  dependency; a small custom runner is the honestly appropriate amount of
+  infrastructure for three focused tests, not GoogleTest for two files.
+
+  Three tests, each checking a real correctness property, not just "didn't
+  crash":
+  1. `setExternal()`'s value is immediately visible via `latest()`.
+  2. The internal fake generator genuinely **stops** overwriting once
+     `setExternal()` is called — sampled repeatedly across ~3.75x the
+     generator's own tick interval, not just checked once (a single check
+     could pass by coincidence if the generator hadn't ticked again yet).
+  3. **No torn reads** under real concurrent pressure: 4 writer threads
+     hammer `setExternal()` with values satisfying a deterministic
+     invariant (`rpm == speedKph * 10`, always) while a reader thread
+     samples `latest()` concurrently for 300ms — if the mutex were broken
+     or removed, a reader could observe `speedKph` from one write
+     interleaved with `rpm` from a different write, breaking that
+     invariant. This is the test that actually exercises the concurrency
+     claim, not just the API.
+
+  All three pass plain, **and clean under ThreadSanitizer**
+  (`-fsanitize=thread`) — no data race reported, real verification beyond
+  "the invariant happened to hold this run":
+  ```
+  clang++ -std=c++20 -pthread -fsanitize=thread -Wall -Wextra \
+      native_tests/telemetry_source_test.cpp app/src/main/cpp/telemetry_source.cpp \
+      -I app/src/main/cpp -o /tmp/telemetry_source_test_tsan && /tmp/telemetry_source_test_tsan
+  ```
 
 ## Build
 
