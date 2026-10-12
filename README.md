@@ -747,6 +747,53 @@ Nine genuine, specific stories from this project, not generic claims:
     restarted process — on-device proof, with both this and the
     SurfaceFlinger line firing together in the same `logcat` stream.
 
+- **Phase 8 (done, verified on-device) — multi-screen windowing, GLES and
+  Vulkan both routed to secondary displays.** `DisplayTracker` listens for
+  `DisplayManager` add/remove events and shows one `Presentation` per
+  secondary display; a pluggable `DisplayPolicy` decides whether it hosts the
+  GLES `HudSurfaceView` or the `VulkanSurfaceView`. Neither renderer changed:
+  each already owns its own render thread and context per surface.
+  `TelemetryRouter` fans telemetry out to every HUD surface, and an exported
+  `ModeSwitchReceiver` toggles the secondary display between GLES and Vulkan
+  from adb. Verified on a Pixel 6a with Developer options → Simulate secondary
+  displays (1920×1080). Launching Unity onto the secondary display with
+  `setLaunchDisplayId` throws a `SecurityException` (cross-display launches
+  need system permissions); it's caught and falls back to the default
+  display. Not yet run on the AAOS build.
+
+- **Phase 9 (done, verified via screenshots) — a cockpit HMI scene in
+  Unity.** An orbiting 3D car with five world-anchored hotspots projected to
+  screen-space labels every frame, plus a bottom nav bar. A bug where the nav
+  bar never moved the highlight was found by comparing screenshots and fixed
+  (screenshots in the repo root, `unity_hmi_*.png`).
+
+- **Phase 10 (done, verified on AAOS and on-device) — the car stack, frame
+  pacing, and a sturdier Vulkan path.**
+  - **Speed from the Vehicle HAL.** `CarSpeedSource` subscribes to
+    `PERF_VEHICLE_SPEED` through `CarPropertyManager` (app → Car Service →
+    Vehicle HAL) on Android Automotive, with the `CAR_SPEED` permission; on a
+    phone the app keeps its own AIDL service. On the self-built `sdv_ivi_cf`
+    image, driven by the fake VHAL's linear generator (`adb root`, then
+    `dumpsys android.hardware.automotive.vehicle.IVehicle/default
+    --genfakedata --startlinear 0x11600207 15 0 15 0.5 100000000`), the app
+    logged 0 → 3.6 → 21.6 → 39.6 → 57.6 → 75.6 km/h and the needle moved.
+  - **Frame pacing: 52 → 60 fps.** The GLES loop slept a fixed 16 ms after
+    `eglSwapBuffers`, which already waits for vsync, so each frame took about
+    19 ms: about 52 fps on the Pixel 6a's 60 Hz display. Without the sleep:
+    59.8–60.2 fps, now logged per 300 frames. A Perfetto trace after the fix
+    (352 frames in 5.86 s, interval median 16.69 ms) showed `dequeueBuffer`
+    taking 13.95 ms of the 14.71 ms `renderFrame` section: the vsync wait
+    moved to the first GL call of the frame, and the real GL work is 0.76 ms.
+    22 of 351 intervals were over 20 ms, so `AChoreographer` pacing is the
+    next step.
+  - **Vulkan: two frames in flight and swapchain rebuild.** Per-slot acquire
+    semaphores and fences, a render-finished semaphore per image, and
+    `imagesInFlight` tracking. The swapchain is rebuilt (passing
+    `oldSwapchain`) on `OUT_OF_DATE`, on `SUBOPTIMAL` when the surface really
+    changed, and on `surfaceChanged`; viewport and scissor are dynamic state.
+    Tested with `adb shell wm size 1080x1800` and `wm size reset`: rebuilt
+    1080×2400 → 1080×1800 → 1080×2400 at about 60 fps.
+
 ## Build
 
 ```
@@ -757,3 +804,12 @@ Requires the Android SDK with NDK `28.2.13676358` and CMake `3.22.1`. Gradle
 is pinned to Android Studio's bundled JBR (JDK 21) via
 `gradle.properties` (`org.gradle.java.home`), so the CLI and the IDE always
 build with the same JVM.
+
+Note (2026-10-12): Android Studio's bundled JBR is now JDK 25, so the JDK 21
+toolchain isn't found automatically. Build with a JDK 21 install, for example
+Homebrew's `openjdk@21`:
+
+```
+J21=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+JAVA_HOME="$J21" ./gradlew :app:assembleDebug "-Porg.gradle.java.installations.paths=$J21"
+```
