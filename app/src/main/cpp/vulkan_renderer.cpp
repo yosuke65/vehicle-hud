@@ -37,6 +37,10 @@ void VulkanRenderer::stop() {
     }
 }
 
+void VulkanRenderer::notifySurfaceChanged() {
+    surfaceChanged_.store(true);
+}
+
 bool VulkanRenderer::createInstance() {
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -199,6 +203,7 @@ bool VulkanRenderer::createSwapchain() {
         extent.height = std::clamp(height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
     }
     swapchainExtent_ = extent;
+    swapchainTransform_ = capabilities.currentTransform;
 
     uint32_t imageCount = capabilities.minImageCount + 1;
     if (capabilities.maxImageCount > 0 && imageCount > capabilities.maxImageCount) {
@@ -219,13 +224,21 @@ bool VulkanRenderer::createSwapchain() {
     createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     createInfo.presentMode = presentMode;
     createInfo.clipped = VK_TRUE;
-    createInfo.oldSwapchain = VK_NULL_HANDLE;
+    // On a rebuild, hand the old swapchain over so the driver can reuse
+    // its resources; it's retired by this call and destroyed right after.
+    createInfo.oldSwapchain = swapchain_;
 
-    VkResult result = vkCreateSwapchainKHR(device_, &createInfo, nullptr, &swapchain_);
+    VkSwapchainKHR newSwapchain = VK_NULL_HANDLE;
+    VkResult result = vkCreateSwapchainKHR(device_, &createInfo, nullptr, &newSwapchain);
+    if (swapchain_ != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+        swapchain_ = VK_NULL_HANDLE;
+    }
     if (result != VK_SUCCESS) {
         LOGE("vkCreateSwapchainKHR failed: %d", result);
         return false;
     }
+    swapchain_ = newSwapchain;
 
     uint32_t actualImageCount = 0;
     vkGetSwapchainImagesKHR(device_, swapchain_, &actualImageCount, nullptr);
@@ -372,24 +385,19 @@ bool VulkanRenderer::createGraphicsPipeline() {
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(swapchainExtent_.width);
-    viewport.height = static_cast<float>(swapchainExtent_.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = swapchainExtent_;
-
+    // Viewport and scissor are dynamic state, set when the command buffers
+    // are recorded. That way a swapchain rebuild at a new size doesn't
+    // need a new pipeline.
     VkPipelineViewportStateCreateInfo viewportState{};
     viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     viewportState.viewportCount = 1;
-    viewportState.pViewports = &viewport;
     viewportState.scissorCount = 1;
-    viewportState.pScissors = &scissor;
+
+    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = 2;
+    dynamicState.pDynamicStates = dynamicStates;
 
     VkPipelineRasterizationStateCreateInfo rasterizer{};
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -432,6 +440,7 @@ bool VulkanRenderer::createGraphicsPipeline() {
     pipelineInfo.pRasterizationState = &rasterizer;
     pipelineInfo.pMultisampleState = &multisampling;
     pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = pipelineLayout_;
     pipelineInfo.renderPass = renderPass_;
     pipelineInfo.subpass = 0;
@@ -473,7 +482,7 @@ bool VulkanRenderer::createFramebuffers() {
     return true;
 }
 
-bool VulkanRenderer::createCommandPoolAndBuffers() {
+bool VulkanRenderer::createCommandPool() {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.queueFamilyIndex = queueFamilyIndex_;
@@ -482,7 +491,10 @@ bool VulkanRenderer::createCommandPoolAndBuffers() {
         LOGE("vkCreateCommandPool failed");
         return false;
     }
+    return true;
+}
 
+bool VulkanRenderer::createCommandBuffers() {
     commandBuffers_.resize(framebuffers_.size());
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -497,8 +509,15 @@ bool VulkanRenderer::createCommandPoolAndBuffers() {
 
     // The scene never changes, so — unlike the GLES render loop, which
     // re-issues its (now minimal) per-frame GL calls every frame — these
-    // command buffers are recorded exactly once, here, not per frame.
+    // command buffers are recorded once per swapchain, not per frame.
     VkClearValue clearColor = {{{0.05f, 0.07f, 0.09f, 1.0f}}};
+
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(swapchainExtent_.width);
+    viewport.height = static_cast<float>(swapchainExtent_.height);
+    viewport.maxDepth = 1.0f;
+    VkRect2D scissor{};
+    scissor.extent = swapchainExtent_;
 
     for (size_t i = 0; i < commandBuffers_.size(); ++i) {
         VkCommandBufferBeginInfo beginInfo{};
@@ -519,6 +538,8 @@ bool VulkanRenderer::createCommandPoolAndBuffers() {
 
         vkCmdBeginRenderPass(commandBuffers_[i], &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(commandBuffers_[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+        vkCmdSetViewport(commandBuffers_[i], 0, 1, &viewport);
+        vkCmdSetScissor(commandBuffers_[i], 0, 1, &scissor);
         vkCmdDraw(commandBuffers_[i], 3, 1, 0, 0);
         vkCmdEndRenderPass(commandBuffers_[i]);
 
@@ -536,14 +557,77 @@ bool VulkanRenderer::createSyncObjects() {
 
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // start signaled so the first drawFrame() doesn't block
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // start signaled so the first use of each slot doesn't block
 
-    if (vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &imageAvailableSemaphore_) != VK_SUCCESS ||
-        vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &renderFinishedSemaphore_) != VK_SUCCESS ||
-        vkCreateFence(device_, &fenceInfo, nullptr, &inFlightFence_) != VK_SUCCESS) {
-        LOGE("Failed to create sync objects");
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        if (vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &imageAvailable_[i]) != VK_SUCCESS ||
+            vkCreateFence(device_, &fenceInfo, nullptr, &inFlightFences_[i]) != VK_SUCCESS) {
+            LOGE("Failed to create sync objects for frame slot %d", i);
+            return false;
+        }
+    }
+    return createRenderFinishedSemaphores();
+}
+
+bool VulkanRenderer::createRenderFinishedSemaphores() {
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+    renderFinished_.assign(swapchainImages_.size(), VK_NULL_HANDLE);
+    for (size_t i = 0; i < renderFinished_.size(); ++i) {
+        if (vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &renderFinished_[i]) != VK_SUCCESS) {
+            LOGE("Failed to create render-finished semaphore %zu", i);
+            return false;
+        }
+    }
+    imagesInFlight_.assign(swapchainImages_.size(), VK_NULL_HANDLE);
+    return true;
+}
+
+void VulkanRenderer::destroySwapchainResources() {
+    if (!commandBuffers_.empty()) {
+        vkFreeCommandBuffers(device_, commandPool_, static_cast<uint32_t>(commandBuffers_.size()),
+                             commandBuffers_.data());
+        commandBuffers_.clear();
+    }
+    for (auto fb : framebuffers_) vkDestroyFramebuffer(device_, fb, nullptr);
+    framebuffers_.clear();
+    for (auto view : swapchainImageViews_) vkDestroyImageView(device_, view, nullptr);
+    swapchainImageViews_.clear();
+    for (auto semaphore : renderFinished_) {
+        if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(device_, semaphore, nullptr);
+    }
+    renderFinished_.clear();
+    imagesInFlight_.clear();
+}
+
+bool VulkanRenderer::swapchainMatchesSurface() const {
+    VkSurfaceCapabilitiesKHR capabilities{};
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface_, &capabilities);
+    return capabilities.currentExtent.width == swapchainExtent_.width &&
+           capabilities.currentExtent.height == swapchainExtent_.height &&
+           capabilities.currentTransform == swapchainTransform_;
+}
+
+bool VulkanRenderer::recreateSwapchain(const char* reason) {
+    // Nothing may be destroyed while the GPU still uses it.
+    vkDeviceWaitIdle(device_);
+
+    VkSurfaceCapabilitiesKHR capabilities{};
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface_, &capabilities);
+    if (capabilities.currentExtent.width == 0 || capabilities.currentExtent.height == 0) {
+        return true; // window has no area right now; try again next frame
+    }
+
+    const VkExtent2D oldExtent = swapchainExtent_;
+    destroySwapchainResources();
+    if (!createSwapchain() || !createImageViews() || !createFramebuffers() || !createCommandBuffers() ||
+        !createRenderFinishedSemaphores()) {
+        LOGE("Swapchain rebuild failed (%s)", reason);
         return false;
     }
+    LOGI("Swapchain rebuilt (%s): %ux%u -> %ux%u", reason, oldExtent.width, oldExtent.height,
+         swapchainExtent_.width, swapchainExtent_.height);
     return true;
 }
 
@@ -557,7 +641,8 @@ bool VulkanRenderer::init() {
     if (!createRenderPass()) return false;
     if (!createGraphicsPipeline()) return false;
     if (!createFramebuffers()) return false;
-    if (!createCommandPoolAndBuffers()) return false;
+    if (!createCommandPool()) return false;
+    if (!createCommandBuffers()) return false;
     if (!createSyncObjects()) return false;
     LOGI("Vulkan renderer initialized on render thread");
     return true;
@@ -583,25 +668,21 @@ void VulkanRenderer::teardown() {
     // be destroyed while still in use by an in-flight GPU submission.
     vkDeviceWaitIdle(device_);
 
-    if (inFlightFence_ != VK_NULL_HANDLE) vkDestroyFence(device_, inFlightFence_, nullptr);
-    if (renderFinishedSemaphore_ != VK_NULL_HANDLE) vkDestroySemaphore(device_, renderFinishedSemaphore_, nullptr);
-    if (imageAvailableSemaphore_ != VK_NULL_HANDLE) vkDestroySemaphore(device_, imageAvailableSemaphore_, nullptr);
-
-    if (commandPool_ != VK_NULL_HANDLE) {
-        vkDestroyCommandPool(device_, commandPool_, nullptr); // frees allocated command buffers too
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        if (inFlightFences_[i] != VK_NULL_HANDLE) vkDestroyFence(device_, inFlightFences_[i], nullptr);
+        if (imageAvailable_[i] != VK_NULL_HANDLE) vkDestroySemaphore(device_, imageAvailable_[i], nullptr);
     }
 
-    for (auto fb : framebuffers_) vkDestroyFramebuffer(device_, fb, nullptr);
-    framebuffers_.clear();
+    // Command buffers, framebuffers, image views, per-image semaphores.
+    destroySwapchainResources();
+    if (commandPool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, commandPool_, nullptr);
 
     if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device_, pipeline_, nullptr);
     if (pipelineLayout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
     if (renderPass_ != VK_NULL_HANDLE) vkDestroyRenderPass(device_, renderPass_, nullptr);
 
-    for (auto view : swapchainImageViews_) vkDestroyImageView(device_, view, nullptr);
-    swapchainImageViews_.clear();
-
     if (swapchain_ != VK_NULL_HANDLE) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+    swapchain_ = VK_NULL_HANDLE;
     vkDestroyDevice(device_, nullptr);
     device_ = VK_NULL_HANDLE;
     vkDestroySurfaceKHR(instance_, surface_, nullptr);
@@ -613,21 +694,42 @@ void VulkanRenderer::teardown() {
 }
 
 bool VulkanRenderer::drawFrame() {
-    vkWaitForFences(device_, 1, &inFlightFence_, VK_TRUE, UINT64_MAX);
+    // surfaceChanged() fires once right after surfaceCreated() too, so only
+    // rebuild if the surface really differs from the current swapchain.
+    if (surfaceChanged_.exchange(false) && !swapchainMatchesSurface()) {
+        if (!recreateSwapchain("surface changed")) return false;
+    }
+
+    VkFence frameFence = inFlightFences_[currentFrame_];
+    vkWaitForFences(device_, 1, &frameFence, VK_TRUE, UINT64_MAX);
 
     uint32_t imageIndex = 0;
-    VkResult acquireResult = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, imageAvailableSemaphore_,
+    VkResult acquireResult = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, imageAvailable_[currentFrame_],
                                                     VK_NULL_HANDLE, &imageIndex);
+    if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
+        // The swapchain no longer matches the surface; nothing was acquired,
+        // so rebuild and draw on the next loop iteration.
+        return recreateSwapchain("acquire OUT_OF_DATE");
+    }
     if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
         LOGE("vkAcquireNextImageKHR failed: %d", acquireResult);
         return false;
     }
 
-    vkResetFences(device_, 1, &inFlightFence_);
+    // With two frames in flight, this image may still be the target of the
+    // other slot's submission. Wait for that one first.
+    if (imagesInFlight_[imageIndex] != VK_NULL_HANDLE) {
+        vkWaitForFences(device_, 1, &imagesInFlight_[imageIndex], VK_TRUE, UINT64_MAX);
+    }
+    imagesInFlight_[imageIndex] = frameFence;
 
-    VkSemaphore waitSemaphores[] = {imageAvailableSemaphore_};
+    // Reset only once we're sure to submit, or the next wait on this fence
+    // would block forever.
+    vkResetFences(device_, 1, &frameFence);
+
+    VkSemaphore waitSemaphores[] = {imageAvailable_[currentFrame_]};
     VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
-    VkSemaphore signalSemaphores[] = {renderFinishedSemaphore_};
+    VkSemaphore signalSemaphores[] = {renderFinished_[imageIndex]};
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -639,7 +741,7 @@ bool VulkanRenderer::drawFrame() {
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = signalSemaphores;
 
-    if (vkQueueSubmit(queue_, 1, &submitInfo, inFlightFence_) != VK_SUCCESS) {
+    if (vkQueueSubmit(queue_, 1, &submitInfo, frameFence) != VK_SUCCESS) {
         LOGE("vkQueueSubmit failed");
         return false;
     }
@@ -654,6 +756,17 @@ bool VulkanRenderer::drawFrame() {
     presentInfo.pImageIndices = &imageIndex;
 
     VkResult presentResult = vkQueuePresentKHR(queue_, &presentInfo);
+    currentFrame_ = (currentFrame_ + 1) % kMaxFramesInFlight;
+
+    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR) {
+        return recreateSwapchain("present OUT_OF_DATE");
+    }
+    // SUBOPTIMAL still presents, but means the surface changed (size or
+    // rotation). Rebuild only if it really differs, so a driver that keeps
+    // reporting SUBOPTIMAL can't cause a rebuild every frame.
+    if (presentResult == VK_SUBOPTIMAL_KHR && !swapchainMatchesSurface()) {
+        return recreateSwapchain("present SUBOPTIMAL");
+    }
     if (presentResult != VK_SUCCESS && presentResult != VK_SUBOPTIMAL_KHR) {
         LOGE("vkQueuePresentKHR failed: %d", presentResult);
         return false;
@@ -668,12 +781,26 @@ void VulkanRenderer::run() {
         return;
     }
 
+    // No sleep: with FIFO present mode, acquiring the next image blocks
+    // until the display frees one, so vsync paces this loop (same fix as
+    // the GLES RenderThread).
+    constexpr int kProfileWindowFrames = 300;
+    int frameCount = 0;
+    auto windowStart = std::chrono::steady_clock::now();
+
     while (running_.load()) {
         if (!drawFrame()) {
             LOGE("drawFrame failed, stopping the Vulkan render loop");
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60fps, same cadence as the GLES path
+        if (++frameCount >= kProfileWindowFrames) {
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - windowStart).count();
+            LOGI("Vulkan: %.1f fps over %d frames, %d frames in flight", frameCount / seconds, frameCount,
+                 kMaxFramesInFlight);
+            frameCount = 0;
+            windowStart = now;
+        }
     }
 
     teardown();

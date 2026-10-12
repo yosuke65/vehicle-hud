@@ -34,7 +34,16 @@ public:
     void start();
     void stop();
 
+    // Called from the UI thread (SurfaceHolder.Callback.surfaceChanged).
+    // Only sets a flag; the render thread rebuilds the swapchain itself.
+    void notifySurfaceChanged();
+
 private:
+    // Two frames in flight: the CPU can prepare frame N+1 while the GPU
+    // still renders frame N. Each slot has its own acquire semaphore and
+    // fence.
+    static constexpr int kMaxFramesInFlight = 2;
+
     void run();
     bool init();
     void teardown();
@@ -49,8 +58,16 @@ private:
     bool createRenderPass();
     bool createGraphicsPipeline();
     bool createFramebuffers();
-    bool createCommandPoolAndBuffers();
+    bool createCommandPool();
+    bool createCommandBuffers();
     bool createSyncObjects();
+    bool createRenderFinishedSemaphores();
+
+    // Swapchain-dependent objects: image views, framebuffers, command
+    // buffers and per-image semaphores. Rebuilt when the surface changes.
+    void destroySwapchainResources();
+    bool recreateSwapchain(const char* reason);
+    bool swapchainMatchesSurface() const;
     std::vector<uint8_t> loadShaderAsset(const char* path) const;
     VkShaderModule createShaderModule(const std::vector<uint8_t>& code) const;
 
@@ -58,6 +75,7 @@ private:
     AAssetManager* assetManager_;
     std::thread thread_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> surfaceChanged_{false};
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
@@ -69,6 +87,7 @@ private:
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
     VkExtent2D swapchainExtent_{};
+    VkSurfaceTransformFlagBitsKHR swapchainTransform_ = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     std::vector<VkImage> swapchainImages_;
     std::vector<VkImageView> swapchainImageViews_;
 
@@ -80,9 +99,15 @@ private:
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_;
 
-    // Single-frame-in-flight: simplest correct sync for a static scene at
-    // this scope. A real app would double/triple-buffer these.
-    VkSemaphore imageAvailableSemaphore_ = VK_NULL_HANDLE;
-    VkSemaphore renderFinishedSemaphore_ = VK_NULL_HANDLE;
-    VkFence inFlightFence_ = VK_NULL_HANDLE;
+    // Per frame slot: acquire semaphore + fence the CPU waits on before
+    // reusing the slot.
+    VkSemaphore imageAvailable_[kMaxFramesInFlight] = {};
+    VkFence inFlightFences_[kMaxFramesInFlight] = {};
+    uint32_t currentFrame_ = 0;
+
+    // Per swapchain image: the "render finished" semaphore that present
+    // waits on, and the fence of the frame slot that last used the image
+    // (an image can come back while an older slot still renders to it).
+    std::vector<VkSemaphore> renderFinished_;
+    std::vector<VkFence> imagesInFlight_;
 };

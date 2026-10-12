@@ -30,6 +30,15 @@ Java_dev_yosukesakurai_vehiclehud_VulkanSurfaceView_nativeSurfaceCreated(
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_dev_yosukesakurai_vehiclehud_VulkanSurfaceView_nativeSurfaceChanged(
+        JNIEnv* /* env */, jobject /* thiz */, jlong handle) {
+    if (handle == 0) {
+        return;
+    }
+    reinterpret_cast<VulkanRenderer*>(handle)->notifySurfaceChanged();
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_dev_yosukesakurai_vehiclehud_VulkanSurfaceView_nativeSurfaceDestroyed(
         JNIEnv* /* env */, jobject /* thiz */, jlong handle) {
     if (handle == 0) {

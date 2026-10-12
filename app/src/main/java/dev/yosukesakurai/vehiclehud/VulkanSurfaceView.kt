@@ -32,9 +32,12 @@ class VulkanSurfaceView @JvmOverloads constructor(
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        // Swapchain extent is read directly from the surface capabilities
-        // on the native side at creation time; nothing to do here for this
-        // minimal example (no resize/recreate-swapchain handling yet).
+        // The render thread checks the surface and rebuilds the swapchain
+        // if the size or rotation really changed.
+        Log.i(TAG, "surfaceChanged: ${width}x$height")
+        if (rendererHandle != 0L) {
+            nativeSurfaceChanged(rendererHandle)
+        }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -46,6 +49,7 @@ class VulkanSurfaceView @JvmOverloads constructor(
 
     private external fun nativeSurfaceCreated(surface: Surface, assetManager: AssetManager): Long
     private external fun nativeSurfaceDestroyed(handle: Long)
+    private external fun nativeSurfaceChanged(handle: Long)
 
     companion object {
         private const val TAG = "VulkanSurfaceView"
