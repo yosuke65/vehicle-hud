@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
@@ -19,6 +20,14 @@ class MainActivity : ComponentActivity() {
     private var telemetryBinder: ITelemetryService? = null
     private var pollThread: Thread? = null
     @Volatile private var polling = false
+    private var aidlBound = false
+
+    // On Android Automotive, speed comes from the Vehicle HAL through
+    // CarPropertyManager instead of the in-app AIDL service.
+    private var carSpeedSource: CarSpeedSource? = null
+    private val isAutomotive by lazy {
+        packageManager.hasSystemFeature(PackageManager.FEATURE_AUTOMOTIVE)
+    }
 
     private val telemetryRouter = TelemetryRouter()
     private var secondaryDisplayMode = SecondaryDisplayMode.HUD
@@ -65,6 +74,45 @@ class MainActivity : ComponentActivity() {
         setContentView(hudView)
 
         ModeSwitchReceiver.callback = { toggleSecondaryDisplayMode() }
+
+        if (isAutomotive &&
+            checkSelfPermission(CarSpeedSource.PERMISSION_SPEED) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(CarSpeedSource.PERMISSION_SPEED), REQUEST_CAR_SPEED)
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CAR_SPEED &&
+            grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
+        ) {
+            // Restart so onStart() picks the Vehicle HAL source.
+            recreate()
+        }
+    }
+
+    private fun startSpeedSource() {
+        if (isAutomotive) {
+            val source = CarSpeedSource(this) { kph -> telemetryRouter.push(kph, 0f) }
+            if (source.start()) {
+                carSpeedSource = source
+                Log.i(TAG, "Speed source: Vehicle HAL via CarPropertyManager")
+                return
+            }
+        }
+        Log.i(TAG, "Speed source: in-app AIDL TelemetryService")
+        aidlBound = bindService(Intent(this, TelemetryService::class.java), connection, Context.BIND_AUTO_CREATE)
+    }
+
+    private fun stopSpeedSource() {
+        carSpeedSource?.stop()
+        carSpeedSource = null
+        stopPolling()
+        if (aidlBound) {
+            unbindService(connection)
+            aidlBound = false
+        }
     }
 
     override fun onDestroy() {
@@ -90,7 +138,7 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         displayTracker.start()
-        bindService(Intent(this, TelemetryService::class.java), connection, Context.BIND_AUTO_CREATE)
+        startSpeedSource()
         if (!displayTracker.hasSecondaryDisplay()) {
             Toast.makeText(
                 this,
@@ -101,8 +149,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        stopPolling()
-        unbindService(connection)
+        stopSpeedSource()
         displayTracker.stop()
         super.onStop()
     }
@@ -167,5 +214,6 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "VehicleHud"
+        private const val REQUEST_CAR_SPEED = 1
     }
 }

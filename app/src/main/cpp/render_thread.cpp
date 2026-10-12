@@ -264,14 +264,19 @@ void RenderThread::run() {
         return;
     }
 
-    // Lightweight, always-on frame-time profiling: measures only the CPU
-    // time actually spent inside renderFrame() (GL calls + swap), not the
-    // sleep — logs a rolling average every kProfileWindowFrames frames.
+    // Lightweight, always-on frame profiling: average CPU time inside
+    // renderFrame() (GL calls + swap) plus the real frame rate over each
+    // window of kProfileWindowFrames frames.
     constexpr int kProfileWindowFrames = 300; // ~5s at 60fps
     long long profileDrawSumMicros = 0;
     long long profileSwapSumMicros = 0;
     int profileFrameCount = 0;
+    auto windowStart = std::chrono::steady_clock::now();
 
+    // No sleep in this loop: eglSwapBuffers already blocks until the
+    // compositor can take the next buffer (swap interval 1), so vsync paces
+    // the loop. A fixed 16 ms sleep on top of that wait made every frame
+    // ~19 ms and capped the HUD at ~52 fps on a 60 Hz display.
     while (running_.load()) {
         // latest() locks only long enough to copy two floats out; every GL
         // call below runs unlocked.
@@ -280,15 +285,17 @@ void RenderThread::run() {
         profileDrawSumMicros += lastDrawMicros_;
         profileSwapSumMicros += lastSwapMicros_;
         if (++profileFrameCount >= kProfileWindowFrames) {
-            LOGI("draw avg: %lld us, swap avg: %lld us, over %d frames",
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - windowStart).count();
+            LOGI("draw avg: %lld us, swap avg: %lld us, %.1f fps over %d frames",
                  profileDrawSumMicros / profileFrameCount,
-                 profileSwapSumMicros / profileFrameCount, profileFrameCount);
+                 profileSwapSumMicros / profileFrameCount,
+                 profileFrameCount / seconds, profileFrameCount);
             profileDrawSumMicros = 0;
             profileSwapSumMicros = 0;
             profileFrameCount = 0;
+            windowStart = now;
         }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60fps
     }
 
     teardownEgl();

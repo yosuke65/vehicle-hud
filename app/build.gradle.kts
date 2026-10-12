@@ -8,6 +8,9 @@ plugins {
 android {
     namespace = "dev.yosukesakurai.vehiclehud"
     compileSdk = 36
+    // Car API (CarPropertyManager) for the Android Automotive speed source.
+    // Provided by the platform at runtime; declared optional in the manifest.
+    useLibrary("android.car")
     ndkVersion = "28.2.13676358"
 
     defaultConfig {

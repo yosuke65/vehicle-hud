@@ -1,12 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Android Automotive only: read speed from the Vehicle HAL. Optional,
+         so the same APK still installs and runs on a phone. -->
+    <uses-feature android:name="android.hardware.type.automotive" android:required="false" />
+    <uses-permission android:name="android.car.permission.CAR_SPEED" />
+
     <application
         android:allowBackup="true"
         android:label="@string/app_name"
         android:resizeableActivity="true"
         android:supportsRtl="true"
         android:theme="@style/Theme.VehicleHud">
+        <uses-library android:name="android.car" android:required="false" />
         <service
             android:name=".TelemetryService"
             android:exported="false"
