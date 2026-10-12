@@ -16,7 +16,7 @@ import android.view.SurfaceView
 class HudSurfaceView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
-) : SurfaceView(context, attrs), SurfaceHolder.Callback {
+) : SurfaceView(context, attrs), SurfaceHolder.Callback, TelemetryConsumer {
 
     private var renderThreadHandle: Long = 0L
 
@@ -56,6 +56,12 @@ class HudSurfaceView @JvmOverloads constructor(
             nativeSetTelemetry(handle, speedKph, rpm)
         }
     }
+
+    /**
+     * Satisfies TelemetryConsumer so the primary HUD can be registered with
+     * TelemetryRouter alongside secondary HUD presentations.
+     */
+    override fun onTelemetry(speedKph: Float, rpm: Float) = pushExternalTelemetry(speedKph, rpm)
 
     private external fun nativeSurfaceCreated(surface: Surface): Long
     private external fun nativeSurfaceDestroyed(handle: Long)

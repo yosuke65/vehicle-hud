@@ -1,5 +1,6 @@
 package dev.yosukesakurai.vehiclehud
 
+import android.app.ActivityOptions
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -7,6 +8,7 @@ import android.content.ServiceConnection
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import kotlin.concurrent.thread
 
@@ -17,6 +19,13 @@ class MainActivity : ComponentActivity() {
     private var telemetryBinder: ITelemetryService? = null
     private var pollThread: Thread? = null
     @Volatile private var polling = false
+
+    private val telemetryRouter = TelemetryRouter()
+    private var secondaryDisplayMode = SecondaryDisplayMode.HUD
+
+    private val displayTracker by lazy {
+        DisplayTracker(this, createPolicyForMode(secondaryDisplayMode))
+    }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, service: IBinder) {
@@ -35,6 +44,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         hudView = HudSurfaceView(this)
+        telemetryRouter.add(hudView)
+
         // Phase 3: tap the HUD to open the separate Vulkan triangle
         // activity. Phase 4: long-press to open the embedded Unity view
         // (UAAL) instead — explicit component name, since
@@ -48,21 +59,81 @@ class MainActivity : ComponentActivity() {
             startActivity(Intent(this, VulkanActivity::class.java))
         }
         hudView.setOnLongClickListener {
-            startActivity(Intent().setClassName(this, "com.unity3d.player.UnityPlayerGameActivity"))
+            launchUnityOnSecondaryDisplay()
             true
         }
         setContentView(hudView)
+
+        ModeSwitchReceiver.callback = { toggleSecondaryDisplayMode() }
+    }
+
+    override fun onDestroy() {
+        ModeSwitchReceiver.callback = null
+        super.onDestroy()
+    }
+
+    private fun toggleSecondaryDisplayMode() {
+        secondaryDisplayMode = when (secondaryDisplayMode) {
+            SecondaryDisplayMode.HUD -> SecondaryDisplayMode.VULKAN
+            SecondaryDisplayMode.VULKAN -> SecondaryDisplayMode.HUD
+        }
+        displayTracker.setPolicy(createPolicyForMode(secondaryDisplayMode))
+        runOnUiThread {
+            Toast.makeText(
+                this@MainActivity,
+                "Secondary display mode: $secondaryDisplayMode",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
     }
 
     override fun onStart() {
         super.onStart()
+        displayTracker.start()
         bindService(Intent(this, TelemetryService::class.java), connection, Context.BIND_AUTO_CREATE)
+        if (!displayTracker.hasSecondaryDisplay()) {
+            Toast.makeText(
+                this,
+                "No secondary display. Enable Developer options -> Simulate secondary displays to test.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     override fun onStop() {
         stopPolling()
         unbindService(connection)
+        displayTracker.stop()
         super.onStop()
+    }
+
+    private fun createPolicyForMode(mode: SecondaryDisplayMode): DisplayPolicy = when (mode) {
+        SecondaryDisplayMode.HUD -> HudPresentationPolicy(this, telemetryRouter)
+        SecondaryDisplayMode.VULKAN -> VulkanPresentationPolicy(this)
+    }
+
+    private fun launchUnityOnSecondaryDisplay() {
+        val intent = Intent().setClassName(this, "com.unity3d.player.UnityPlayerGameActivity")
+        val displayId = displayTracker.firstDisplayId()
+        if (displayId != null) {
+            try {
+                val options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId)
+                startActivity(intent, options.toBundle())
+                return
+            } catch (e: SecurityException) {
+                // Stock Android restricts launching Activities on a secondary
+                // display to apps holding system permissions (e.g.
+                // ACTIVITY_EMBEDDING). Fall back to the default display rather
+                // than crashing the host app.
+                Log.w(TAG, "Cannot launch Unity on display $displayId: ${e.message}")
+                Toast.makeText(
+                    this,
+                    "Secondary-display launch denied; falling back to default display",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+        startActivity(intent)
     }
 
     private fun startPolling() {
@@ -78,7 +149,7 @@ class MainActivity : ComponentActivity() {
                     try {
                         val speed = binder.getSpeedKph()
                         val rpm = binder.getRpm()
-                        hudView.pushExternalTelemetry(speed, rpm)
+                        telemetryRouter.push(speed, rpm)
                     } catch (e: Exception) {
                         Log.e(TAG, "AIDL call to TelemetryService failed", e)
                     }

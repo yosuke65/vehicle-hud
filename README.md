@@ -57,15 +57,34 @@ module merged into this same app, not this project's code) via long-press.
 
 ## What this demonstrates, and what it honestly doesn't (AOSP scope)
 
-Built as an **app-layer NDK project** — C/C++, threading, EGL/OpenGL ES, and
-AIDL as a client — deliberately scoped to fit a Mac dev environment with no
-Linux box. It does **not** touch the real AOSP source tree, a HAL
-implementation registered in the OS image, or the Soong/Blueprint build
-system — that would require a Linux host (Cuttlefish needs KVM) and was
-explicitly out of scope for a 5-day week around a full-time job. Said
-directly, this is the honest scope: *"app-layer C++/threading/graphics/IPC,
-not platform-layer AOSP — and here's specifically why, and what I'd need to
-go further."*
+Started as an **app-layer NDK project** — C/C++, threading, EGL/OpenGL ES,
+and AIDL as a client — deliberately scoped to fit a Mac dev environment with
+no Linux box, explicitly deferring the real AOSP source tree, a HAL
+implementation registered in the OS image, and the Soong/Blueprint build
+system as out of scope for a 5-day week around a full-time job.
+
+That deferred scope was later pursued for real, on a second physical
+machine (an Intel MacBook wiped to Ubuntu). Real, verified outcomes: a
+correct `repo`-synced AOSP checkout (1084/1084 projects) on the
+Google-recommended `android-latest-release` branch after finding and fixing
+a wrong-branch/wrong-config mistake against Google's own docs; genuine
+Soong/Blueprint debugging (an `Android.bp` property version mismatch,
+tracked to the exact line in Soong's source); two full Android Automotive
+system builds (`sdv_core_cf`, `sdv_ivi_cf`) that actually compiled and
+booted on Cuttlefish, the second with a real, screenshotted two-display
+digital cockpit UI; and this same app installed and tested directly on that
+self-built automotive OS (Phase 7 below); and, going one step further, a
+real code change to SurfaceFlinger itself and to a real Vehicle HAL
+implementation (`FakeVehicleHardware::setValue`), each built through the
+fast incremental platform-dev inner loop and verified live on the running
+device via `adb logcat` — genuine implementation-level touches, not just
+build-only exposure. What's still genuinely not touched: HWComposer/Gralloc
+specifically, and no HAL authored fully from scratch (the edit was to an
+existing fake implementation, not a new HAL). Said directly, the honest
+scope is now: *"app-layer C++/threading/graphics/IPC, plus real hands-on
+AOSP platform/build-system work, a real automotive boot, and verified
+edits to the compositor and a Vehicle HAL — and here's specifically what's
+still untouched."*
 
 ## Talking points for the interview
 
@@ -170,6 +189,45 @@ Nine genuine, specific stories from this project, not generic claims:
    a torn read under real concurrent pressure (4 writers + 1 reader, a
    deterministic invariant that a broken mutex would violate). Clean under
    ThreadSanitizer, not just passing by luck.
+10. **When a guess turns out wrong, check the source of truth instead of
+    guessing again.** Attempting a real AOSP Automotive build, the first
+    `repo init` branch and lunch config were both guessed — one from a
+    NOTICE banner half-read, one from an unrelated source comment — and
+    hit a wall three errors deep (a foundational AIDL interface,
+    `google.sdv.identity`, absent from every public AOSP repo). Instead of
+    a fourth guess, read Google's actual `source.android.com` docs
+    directly: both guesses were wrong, in specific, findable ways. Fixed
+    both, re-synced, and every dependency error vanished — direct
+    confirmation the root-cause read was correct, not just a fix that
+    happened to work. Full detail in the Phase 7 log entry below.
+11. **Cross-deploying this exact app onto a self-built automotive OS: three
+    confirmed, one wall precisely diagnosed.** Installed this project's own
+    debug APK onto a real AAOS system built and booted from AOSP source
+    (Phase 7). AIDL/OpenGL ES confirmed via the app's own perf log firing
+    on real automotive hardware, not just "it launched." Vulkan confirmed
+    via `dumpsys window` genuinely switching focus, not a visual guess
+    (its screenshot looked similar to the GLES view, which wasn't
+    diagnostic on its own — the two shapes are both simple green geometry
+    on black). Unity/UAAL crashed with `UnsatisfiedLinkError` for
+    `libgame.so`; attempted the real fix (adding x86_64 as a target
+    architecture) and got a definitive answer from Unity's own compiler
+    warning that x86_64 Android support has been fully removed from this
+    Editor version — a genuine product limitation, confirmed by trying the
+    fix, not assumed from the crash alone.
+12. **Knowing exactly which wall is real vs. an artifact of the test rig.**
+    Checked the Unity/UAAL crash above against Unity's actual HMI product
+    page (the one this role's automotive customers — Toyota, Mercedes-Benz,
+    Mazda — are named on). Their pipeline is Unity Industry + Embedded
+    platform support, a licensed enterprise product targeting ARM
+    automotive SoCs — genuinely out of reach here, and I said so plainly
+    rather than implying it was one tweak away. But that also means the
+    x86_64 crash on Cuttlefish isn't evidence Unity can't do this — it's
+    an artifact of Cuttlefish being an x86_64 virtual device, while this
+    project's own Unity build is already ARM64-only and was separately
+    verified working on real ARM64 Android hardware in Phase 4. Not
+    confusing a licensing boundary with a technical one, or a test-rig
+    limitation with a product limitation, is itself the platform-literacy
+    the JD is asking for.
 
 ## Day-by-day log
 
@@ -533,6 +591,161 @@ Nine genuine, specific stories from this project, not generic claims:
       native_tests/telemetry_source_test.cpp app/src/main/cpp/telemetry_source.cpp \
       -I app/src/main/cpp -o /tmp/telemetry_source_test_tsan && /tmp/telemetry_source_test_tsan
   ```
+
+- **Phase 7 (done) — a real AOSP Automotive build, booted, with this app
+  running on it.** The scope this project originally deferred (see above):
+  pursued for real on a second physical machine, an Intel MacBook wiped to
+  T2-patched Ubuntu 24.04, reachable over Tailscale.
+
+  **Wrong branch, wrong release config — found by reading the actual
+  official docs, not by guessing again.** First attempt: `repo init -b
+  main` (AOSP trunk) plus a guessed `sdv_core_tiny_cf-trunk_staging-userdebug`
+  lunch line, guessed from an unrelated source comment. Hit three real
+  build errors in sequence — a Soong `Android.bp` property
+  (`use_expansive_default_srcs`) that this `main`-branch Soong didn't
+  recognize (verified all 140 occurrences were harmlessly `false` and
+  stripped it), a dangling test fixture depending on already-removed
+  sample code, and finally `google.sdv.identity` — a foundational AIDL
+  interface imported by 21+ files, confirmed absent from every public repo
+  on `android.googlesource.com`. That last one wasn't stub-able honestly,
+  so instead of guessing a fourth fix, read Google's actual
+  `source.android.com/docs/automotive/sdv` documentation directly. It
+  states plainly, on multiple pages, to use the `android-latest-release`
+  manifest branch and the `aosp_current` release config — both different
+  from what had been guessed, and Google's own sync tooling had been
+  printing a NOTICE recommending exactly this the whole time. Re-synced on
+  the correct branch (1084/1084 projects; the SDV service repos turned out
+  to already be wired into that branch's default manifest, no local
+  manifest hack needed there), and every dependency error vanished — the
+  first fix attempt was real config, the second attempt made it to 100% of
+  Soong's own analysis with zero dependency errors, confirming the
+  root-cause diagnosis was exactly right.
+
+  **A real Soong bootstrap OOM, fixed with evidence, not guesswork.** That
+  same 100%-complete analysis run got killed by the OOM killer
+  (`exit=137`) in its very last step — 15GB RAM + 15GB swap wasn't enough
+  to hold the full 1084-project dependency graph in memory for a single
+  Go process. Added a 30GB swapfile (45GB total; the connected external
+  drive had disk to spare) and reran the identical build:
+  `lunch sdv_core_tiny_cf-aosp_current-userdebug && m -j4` succeeded in
+  full — `Build Succeeded: 78216 steps` in ~8h22m — with real
+  `boot.img`/`system.img`/`super.img` output matching exactly what the
+  target's own product config says it should contain.
+
+  **A visual automotive cockpit, not just a build log.** `sdv_core_cf` is
+  headless (Google's own docs say so); building the visual `sdv_ivi_cf`
+  variant instead (`Build Succeeded: 145857 steps`, ~15h57m — the fuller
+  UI stack: SurfaceFlinger, SystemUI, WindowManager) and getting it to
+  actually *boot* took real, sequential troubleshooting: no `cvd` wrapper
+  installed (used this build's own `launch_cvd` directly); both `crosvm`
+  and `qemu_cli` VM backends failing with an identical generic error,
+  traced by reading Cuttlefish's own `vm_manager.cpp`/`config_utils.cpp`
+  source to one shared gating check —`HostSupportsQemuCli()` — verifying a
+  `cuttlefish-common` Debian package that wasn't installed and isn't in
+  Ubuntu's default repos or on GitHub releases anymore. Built it from
+  source per Google's current instructions, added the required
+  `kvm`/`cvdnetwork`/`render` groups, and it booted cleanly:
+  `sys.boot_completed=1`, a live WebRTC stream, and a real screenshot of a
+  genuine two-display AAOS cockpit (head unit + separate instrument
+  cluster) — including Google's own real `CarService` placeholder text,
+  proof this is authentic framework code, not a mockup.
+
+  **This same app, installed and tested on that self-built automotive OS.**
+  Not a separate demo — the actual debug APK from this project, `adb
+  install`ed onto the booted `cvd-1` instance and launched explicitly
+  (`adb shell am start`, since it's not a declared automotive app — AAOS
+  applied its own `0.7x` density compat-scale automatically, a real minor
+  detail worth knowing about, not a failure). Three of four pieces
+  verified working, one genuine wall found and precisely diagnosed:
+  - **AIDL + OpenGL ES:** confirmed via the app's *own* runtime perf log
+    firing on real automotive hardware config (`VehicleHud: draw avg: 144
+    us, swap avg: 1684 us, over 300 frames`, window bounds
+    `Rect(0,0-1080,600)`) — real frames, not just "it launched."
+  - **Vulkan:** confirmed via `dumpsys window` genuinely showing
+    `mCurrentFocus`/`mFocusedApp` switch to `.VulkanActivity` with no
+    crash — the authoritative check, since the WebRTC screenshot alone
+    looked visually similar to the GLES view (both are simple green
+    shapes on black) and wasn't diagnostic on its own.
+  - **UAAL/Unity: a real architectural wall, precisely diagnosed, not a
+    code bug.** Long-press launched `UnityPlayerGameActivity`, which
+    crashed immediately: `UnsatisfiedLinkError: dlopen failed: library
+    "libgame.so" not found`. Root cause: this APK's Unity IL2CPP native
+    output is ARM64-only (built for real phones); Cuttlefish is x86_64,
+    and Unity's native code is architecture-specific compiled machine
+    code, not portable bytecode. Attempted the real fix — added
+    `AndroidArchitecture.X86_64` to `PlayerSettings.Android
+    .targetArchitectures` in `vehicle-hud-unity`'s build script and ran a
+    clean batch-mode rebuild — and got a definitive answer from the
+    Editor itself: `CS0618: 'AndroidArchitecture.X86_64' is obsolete:
+    'X86_64 is no longer supported.'` Unity 6000.5.9f1 has fully removed
+    x86_64 Android support; the setting is a silent no-op. Not fixable
+    from this project — a genuine Unity product limitation, verified by
+    attempting the fix and reading the compiler's own answer, not assumed.
+    Reverted the pointless setting, documented why in the build script,
+    and confirmed the export still works normally for its real target
+    (ARM64 phones).
+  - **What this wall actually means, checked against Unity's own product
+    page:** Unity's automotive HMI case studies (Toyota, Mercedes-Benz AG,
+    Mazda's 2027 CX-5) run on **Unity Industry + Embedded platform
+    support** — a separate enterprise product from the standard Editor
+    used here, access-gated per Unity's own FAQ ("contact your account
+    manager or the Unity Sales team for access"). That's a real, honest
+    boundary — not reproducible from this project, and not worth
+    pretending otherwise. But the same FAQ states those embedded runtimes
+    target **ARM-based processors**, which reframes the wall above: it's
+    specific to Cuttlefish being an **x86_64 virtual device** (an
+    artifact of testing on this Intel Mac's host architecture), not proof
+    Unity can't do automotive HMI. This project's own Unity/UAAL build is
+    already ARM64-only by default — the same architecture real automotive
+    silicon uses — and was already verified working via on-device testing
+    in Phase 4, on real ARM64 Android hardware, before this AOSP/Cuttlefish
+    detour. So: the exact enterprise pipeline Mazda uses is out of reach,
+    but the underlying capability (Unity real-time rendering as embedded
+    automotive HMI content) already has two independent, real pieces of
+    evidence behind it here — ARM64 on-device UAAL, and a self-built,
+    booted AAOS system with AIDL/GLES/Vulkan verified live on it — and the
+    one wall in between is a test-harness CPU-architecture mismatch, not a
+    capability gap.
+
+  **Closing the last two implementation-level gaps: SurfaceFlinger and a
+  real HAL, each edited and verified live, not just compiled.** Real
+  platform-development inner loop — the fast one (incremental build +
+  push + targeted service restart), not another multi-hour full image
+  build, since the baseline `sdv_ivi_cf` was already booted.
+  - **SurfaceFlinger:** added a real log line to
+    `SurfaceFlinger::onCompositionPresented()` (a genuine per-frame
+    present-latency marker for the pacesetter display, matching existing
+    `.ns()`/`to_string()`/`nanoseconds_to_milliseconds()` conventions
+    already used elsewhere in the same file — not a cosmetic no-op).
+    Incremental build (`m surfaceflinger`, scoped to 1280 total steps vs.
+    78K/194K for a full image): **`Build Succeeded` in 2m23s.** Pushed the
+    new binary directly (`adb root && disable-verity && reboot && remount
+    && adb push`), restarted just that service
+    (`adb shell stop/start surfaceflinger`), and confirmed via `adb
+    logcat` that the line fires on every real composed frame from the
+    actual running process, with genuine varying present-latency numbers
+    (1-3ms) — not stale output.
+  - **A real HAL, with an honest correction along the way.** Added a
+    write-confirmation log line to `FakeVehicleHardware::setValue()` (the
+    real per-property VHAL write path), matching the file's existing
+    `PROP_ID_TO_CSTR` logging convention. First deployment attempt guessed
+    the wrong binary — `vhal_proxy_server`, a host-side tool that also
+    links this same library, but isn't the service actually registered as
+    the guest's live `IVehicle/default` — found out by testing, not
+    assuming: triggered a real property write and the log never fired.
+    `adb shell ps -A` plus reading the real `Android.bp` found the
+    genuine serving process,
+    `android.hardware.automotive.vehicle@V1-sdv-emulator-service`, which
+    statically links the same edited library — confirming the source edit
+    was right, only the deployment target was wrong. Rebuilt that correct
+    target (46s), pushed it, and restarted it via its real init service
+    name pulled from its own `.rc` file (`vendor.sdv-vehicle-hal-emulator`
+    — not the AIDL interface name, a genuine gotcha). Verified live: a
+    real triggered property write (`dumpsys
+    android.hardware.automotive.vehicle.IVehicle/default --set
+    HVAC_TEMPERATURE_SET ...`) produced the new log line from the newly
+    restarted process — on-device proof, with both this and the
+    SurfaceFlinger line firing together in the same `logcat` stream.
 
 ## Build
 
