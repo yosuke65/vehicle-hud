@@ -895,9 +895,39 @@ Nine genuine, specific stories from this project, not generic claims:
     textures ("format unsupported for random writes"), so the RenderTexture
     asks for random writes only on Vulkan, which is the only path that needs
     them. Like the Cuttlefish cockpit, this image has a private cluster
-    display (display 2) and a private `ClusterOsDouble-VD`. Not done here: Unity on
-    Vulkan in the emulator, and Unity on the self-built image (that needs an
-    arm64 car target such as `sdk_car_arm64`, built on the Ubuntu box).
+    display (display 2) and a private `ClusterOsDouble-VD`. Not done here:
+    Unity on Vulkan in the emulator.
+  - **On the self-built AAOS image (same night).** The self-built
+    `sdv_ivi_cf` Cuttlefish is x86_64, with no native bridge
+    (`ro.dalvik.vm.native.bridge=0`, even though the ABI list also names
+    arm64-v8a), and Unity 6.5 removed x86_64 Android. Unity 6.0 LTS
+    (6000.0.84f1) still builds x86-64 (IL2CPP only; Unity labels it "Magic
+    Leap 2"), so a copy of the Unity project, `vehicle-hud-unity-x86`, is
+    built with 6.0: ARM64 plus x86_64, GLES only, because the guest renders
+    with SwiftShader (`gpu_mode` `guest_swiftshader`). Changes needed for
+    the 6.0 copy: drop three 6.5-only modules from `Packages/manifest.json`
+    (adaptiveperformance, physicscore2d, vectorgraphics), and run the Gradle
+    daemon on JDK 21 (`-Dorg.gradle.java.home=...`). Unity 6.0 compiles
+    IL2CPP in a CMake step inside Gradle, and with Android Studio's JDK 25
+    that step failed on "A restricted method in java.lang.System has been
+    called". `ABI=x86_64 unity-plugin/build.sh` builds the plugin for
+    x86_64; `-PunityExportDir=../vehicle-hud-unity-x86/Builds/AndroidExport`
+    builds the app against that export. On the image, Unity logged Device
+    Model "Google IVI and Software-Defined Vehicle Core", CPU x86_64, OpenGL
+    ES 3, and both dials drew (`glGetError` 0). The speed came from the
+    image's own Vehicle HAL through `CarPropertyManager`: 15 m/s showed as
+    54 km/h and 40 m/s as 144 km/h on both dials
+    (`unity_plugin_sdv_ivi_cf_54kmh.png`, `unity_plugin_sdv_ivi_cf_144kmh.png`).
+    Build for that image:
+
+    ```
+    J21=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+    ABI=x86_64 UNITY_PROJECT=../vehicle-hud-unity-x86 unity-plugin/build.sh
+    # Unity 6000.0.84f1: -executeMethod SceneSetup.ConfigureAndroidExportX86AndBuild
+    JAVA_HOME="$J21" ./gradlew :app:assembleDebug "-Dorg.gradle.java.home=$J21" \
+        "-Porg.gradle.java.installations.paths=$J21" \
+        -PunityExportDir=../vehicle-hud-unity-x86/Builds/AndroidExport
+    ```
 
 ## Build
 

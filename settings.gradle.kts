@@ -16,7 +16,13 @@ pluginManagement {
 // Phase 4 (UAAL): unityLibrary lives in the separate vehicle-hud-unity
 // project's export output, not copied into this repo — referenced in
 // place so re-exporting from Unity picks up here without a manual copy.
-val unityExportDir = file("../vehicle-hud-unity/Builds/AndroidExport")
+// Which Unity export to build against. Default: the Unity 6.5 project
+// (ARM64 only). -PunityExportDir=../vehicle-hud-unity-x86/Builds/AndroidExport
+// picks the Unity 6.0 copy that also builds x86_64, for the self-built
+// x86_64 Cuttlefish AAOS image.
+val unityExportDir = file(
+    providers.gradleProperty("unityExportDir").getOrElse("../vehicle-hud-unity/Builds/AndroidExport")
+)
 
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
