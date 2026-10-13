@@ -11,49 +11,47 @@ week's design brief.
 
 ## Architecture
 
-Four threads, one process boundary:
+One speed stream, one process boundary, three renderers (current design,
+after Phase 12; the original Phase 1 design polled the service from its own
+thread):
 
 ```
- UI thread (MainActivity)
-   │ binds to, polls every ~100ms
+ Speed source (started while any of the app's activities is started)
+   AAOS:  CarSpeedSource → CarPropertyManager → Car Service → Vehicle HAL
+   phone: :telemetry process (TelemetryService) → oneway ITelemetryListener
+          (Binder callback, ~10 Hz; MainActivity links to the service's death)
    ▼
- :telemetry process (TelemetryService)
-   │ AIDL / Binder IPC
-   ▼
- TelemetryAidlPoll thread (MainActivity)
-   │ JNI: pushExternalTelemetry() → setExternalTelemetry() → setExternal()
-   ▼
- TelemetrySource (C++, mutex-guarded latest-value slot)
-   ▲
-   │ internal generator thread writes here too, until external data arrives
-   │
- Render thread (RenderThread, owns the EGL context)
-   reads TelemetrySource.latest() each frame → draws → eglSwapBuffers
+ TelemetryRouter.shared (process-wide fan-out)
+   ├─ HudSurfaceView    → JNI → TelemetrySource (C++)  → GLES render thread
+   ├─ VulkanSurfaceView → JNI → atomic                  → Vulkan render thread
+   └─ UnityDialBridge   → JNI → atomic in libhudgfx     → Unity's render thread
+                                                          (UnityGfxDeviceWorker)
 ```
 
-- **Render thread** (`RenderThread`, `render_thread.cpp`): the only thread
-  that ever touches EGL/GL. Created in `surfaceCreated`, torn down
-  (`eglMakeCurrent(NO_CONTEXT)` → destroy context/surface → terminate) in
-  `surfaceDestroyed`, always on the same thread it was created on.
+- **GLES render thread** (`RenderThread`, `render_thread.cpp`): the only
+  thread that touches its EGL context. Created in `surfaceCreated`, torn
+  down (`eglMakeCurrent(NO_CONTEXT)` → destroy context/surface → terminate)
+  in `surfaceDestroyed`, always on the same thread it was created on.
+- **Vulkan render thread** (`VulkanRenderer`): same discipline for its own
+  instance, device and swapchain. Draws the speed dial; the needle value is
+  a push constant, recorded every frame.
+- **Unity's render thread**: the plugin (`unity-plugin/hudgfx.cpp`) draws the
+  dial there through `GL.IssuePluginEvent`, with Unity's own GL context or
+  Vulkan command buffer.
 - **Internal telemetry thread** (`TelemetrySource`, `telemetry_source.cpp`):
-  generates fake speed/RPM at ~10Hz into a mutex-guarded slot. Stops writing
-  the moment external data arrives (an atomic flag), so it hands off cleanly
-  instead of racing with the AIDL-fed values.
-- **AIDL poll thread** (`MainActivity.kt`): binds to `TelemetryService`,
-  which runs in a **separate OS process** (`android:process=":telemetry"`),
-  and polls it at ~10Hz on its own thread — deliberately never the UI thread
-  or the render thread, since a synchronous Binder call blocks whatever
-  thread calls it.
-- **UI thread**: only owns the `ServiceConnection` callback and Activity
-  lifecycle; never touches EGL, GL, or the telemetry mutex directly.
+  generates fake speed/RPM at ~10Hz into a mutex-guarded slot until external
+  data arrives (an atomic flag), so it hands off cleanly.
+- **Binder threads**: the `:telemetry` service pushes samples through a
+  oneway callback, so no thread in the app blocks on a Binder call. The
+  service keeps listeners in a `RemoteCallbackList`.
+- **UI thread**: owns the `ServiceConnection` and the activity lifecycle;
+  never touches EGL, GL, Vulkan or the telemetry state directly.
 
-Two more systems exist alongside all of this, both reachable from the HUD:
-**`VulkanActivity`/`VulkanRenderer`** (Phase 3, own render thread, own
-teardown discipline, zero shared state with the diagram above) via tap,
-kept deliberately separate so a Vulkan mistake could never touch the
-working system described here; and **Unity's own
-`UnityPlayerGameActivity`** (Phase 4, UAAL — a real `unityLibrary` Gradle
-module merged into this same app, not this project's code) via long-press.
+`VulkanActivity` opens with a tap on the HUD. A long-press opens Unity's
+`UnityPlayerGameActivity` (UAAL, a `unityLibrary` Gradle module merged into
+the app): on a phone on the default display, on Android Automotive on the
+driver's instrument cluster when the app holds the platform permissions
+(Phase 12).
 
 ## What this demonstrates, and what it honestly doesn't (AOSP scope)
 
@@ -78,17 +76,26 @@ real code change to SurfaceFlinger itself and to a real Vehicle HAL
 implementation (`FakeVehicleHardware::setValue`), each built through the
 fast incremental platform-dev inner loop and verified live on the running
 device via `adb logcat` — genuine implementation-level touches, not just
-build-only exposure. What's still genuinely not touched: HWComposer/Gralloc
-specifically, and no HAL authored fully from scratch (the edit was to an
-existing fake implementation, not a new HAL). Said directly, the honest
-scope is now: *"app-layer C++/threading/graphics/IPC, plus real hands-on
-AOSP platform/build-system work, a real automotive boot, and verified
-edits to the compositor and a Vehicle HAL — and here's specifically what's
-still untouched."*
+build-only exposure. Phases 8–12 then added: the Car API path (speed from
+the Vehicle HAL through `CarPropertyManager`), HWComposer and Gralloc
+observed with `dumpsys` and Perfetto on the Pixel and on Cuttlefish, a Unity
+native rendering plugin (GLES and Vulkan), Unity running on the self-built
+image including the driver's instrument cluster, and a first Blueprint
+module that installs the HUD as a privileged, platform-signed app in
+`system_ext`. What's still genuinely not touched: HWComposer/Gralloc code
+(observed, not written), no HAL authored fully from scratch (the edit was to
+an existing fake implementation), no SELinux policy, and no real automotive
+hardware (a phone, an emulator and Cuttlefish only). Said directly, the
+honest scope is now: *"app-layer C++/threading/graphics/IPC, plus real
+hands-on AOSP platform/build-system work, a real automotive boot, verified
+edits to the compositor and a Vehicle HAL, a Unity native plugin on that
+image's cluster, and a first Blueprint module — and here's specifically
+what's still untouched."*
 
 ## Talking points for the interview
 
-Nine genuine, specific stories from this project, not generic claims:
+Specific stories from this project, not generic claims (1–12 from Phases
+1–10, 13–16 from Phases 11–12):
 
 1. **A real bug, found by reading a stack trace, not guessing.** The AIDL
    binder's first implementation — `override fun getSpeedKph(): Float =
@@ -227,7 +234,40 @@ Nine genuine, specific stories from this project, not generic claims:
     verified working on real ARM64 Android hardware in Phase 4. Not
     confusing a licensing boundary with a technical one, or a test-rig
     limitation with a product limitation, is itself the platform-literacy
-    the JD is asking for.
+    the JD is asking for. (Update, Phase 11: the image has no native bridge
+    to translate ARM code, and Unity 6.5 dropped x86_64, but Unity 6.0 LTS
+    still builds it. A 6.0 build now runs on the self-built image, including
+    its instrument cluster.)
+13. **Inside Unity's frame: two walls, and what they taught.** The native
+    plugin (`unity-plugin/hudgfx.cpp`) showed Unity picking GLES on the Pixel
+    6a, because Unity's Vulkan filter keeps Pixel 6 phones off Vulkan by
+    default; with an allow-list entry it ran on Vulkan and the plugin read
+    Mali-G78, Vulkan 1.4. Drawing into a Unity texture on Vulkan, the first
+    try began a render pass and failed: Unity hands plugin events a
+    *secondary* command buffer, where a render pass can't begin. The fix was
+    a compute shader on the texture after `AccessTexture`.
+14. **The cluster: from invisible to running.** The driver's cluster is a
+    private display, so a normal app can't even see it. The HUD asks
+    `CarOccupantZoneManager` for its ID (needs `ACCESS_PRIVATE_DISPLAY_ID`)
+    and launches Unity there (needs `INTERNAL_SYSTEM_WINDOW`), both granted
+    by the build's AOSP test platform key. Car Service then covered it with
+    `ActivityBlockingActivity` until the activities were declared
+    distraction-optimized. Packaged as a first Blueprint module
+    (`android_app_import`, privileged, platform certificate, system_ext);
+    `m VehicleHud` took 52 minutes, almost all Soong re-analysis.
+15. **Measuring the failure path, not just the happy path.** Killing the
+    `:telemetry` service three times: `binderDied` arrived at once, and
+    Android restarted it after 1 s, 4 s and 16 s. A car HMI therefore has to
+    show stale data instead of waiting for the restart.
+16. **A startup gap I first misread.** Android's "Displayed" (+173 ms) and
+    Unity's own "Fully drawn" (+619 ms) said Unity was up in about 0.6 s on
+    the Pixel 6a, but the plugin's first event, right after the first scene
+    loads, came at 2.6 s. I first wrote that gap up as scene loading. The
+    Unity splash screen was still on. With it off (vehicle-hud-unity
+    `9feb398`), the first plugin event came at 0.3–0.5 s on the Pixel and
+    about 0.5 s on the AAOS emulator: the splash was about 2.1 s of it.
+    Measure the first frame of the real scene, and check what was on screen
+    before explaining a gap.
 
 ## Day-by-day log
 
@@ -857,8 +897,10 @@ Nine genuine, specific stories from this project, not generic claims:
     (`ActivityLifecycleCallbacks`). Checked by screenshots taken right after
     a speed log line: 59.7 km/h on the 60 tick, 43.6 between 30 and 60. On a
     phone the speed comes from the in-app AIDL service; on AAOS the same
-    router is fed by `CarPropertyManager`, but Unity doesn't run on the
-    x86_64 Cuttlefish build, so that end-to-end path isn't verified.
+    router is fed by `CarPropertyManager`. At this point Unity didn't run on
+    the x86_64 Cuttlefish build, so that end-to-end path wasn't verified yet;
+    it was later the same night, on Google's AAOS emulator and then on the
+    self-built image (the next bullets).
   - **Drawing into a Unity texture (same day).** C# creates a 512×512
     `RenderTexture` (`enableRandomWrite`), passes `GetNativeTexturePtr()` to
     the plugin, and shows it on a world-space panel above the car. Event 2
@@ -955,7 +997,8 @@ Nine genuine, specific stories from this project, not generic claims:
     On the AAOS emulator, 10 m/s in the Vehicle HAL showed 36 km/h and
     45 m/s showed 162 km/h (`vulkan_needle_aaos_emulator.png`), at 60.7 fps.
   - **Startup and memory.** `am start -S -W` for the HUD, then a long-press
-    into Unity, then `dumpsys meminfo`:
+    into Unity, then `dumpsys meminfo`. Unity ran on Vulkan in every run
+    here. In this first set, Unity's splash screen was still on:
 
     | | Pixel 6a | AAOS emulator (M5 Mac) |
     |---|---|---|
@@ -966,16 +1009,37 @@ Nine genuine, specific stories from this project, not generic claims:
     | PSS, HUD only | 92 MB (graphics 44 MB) | 51 MB |
     | PSS, Unity open | 229 MB (graphics 83 MB) | 163 MB |
 
-    "Displayed" only means the activity's window drew its first frame, and
-    Unity reports "Fully drawn" at about 620 ms. The plugin bridge is
-    created right after the first scene loads
-    (`RuntimeInitializeOnLoadMethod(AfterSceneLoad)`), so its first event at
-    ~2.6 s marks when the scene was actually ready: about 2 s after Android
-    already counted the launch as finished. The startup metric that matters
-    is the first frame of the real scene. On the Pixel, the
-    EGL buffers with Unity open are 31.1 MB: exactly three 1080×2400 RGBA
-    buffers, so Unity's surface is triple-buffered. The `:telemetry`
-    process adds 27 MB of its own.
+    Then with the splash screen off (vehicle-hud-unity `9feb398`: the export
+    method sets `PlayerSettings.SplashScreen.show = false`), cold Unity
+    opens (app force-stopped, HUD started, long-press):
+
+    | | Pixel 6a (4 opens) | AAOS emulator (3 opens) |
+    |---|---|---|
+    | Unity "Displayed" | +103 to +149 ms | +107 to +144 ms |
+    | Unity "Fully drawn" (reported by Unity) | +401 to +713 ms | +526 to +574 ms |
+    | Unity activity start → first plugin event | 298–536 ms | 474–512 ms |
+
+    "Displayed" only means the activity's window drew its first frame. The
+    plugin bridge is created right after the first scene loads
+    (`RuntimeInitializeOnLoadMethod(AfterSceneLoad)`), so its first event
+    marks when the scene was really ready. With the splash on, that was
+    ~2.6 s, about 2 s after Unity's own "Fully drawn" at ~620 ms, so "Fully
+    drawn" didn't mark the scene. With the splash off, the first plugin
+    event came at 0.3–0.5 s on the Pixel and ~0.5 s on the emulator, and
+    "Fully drawn" followed it within 0.2 s. The splash cost about 2.1 s on
+    both devices. The startup metric that matters is the first frame of the
+    real scene. The Unity 6.0 x86_64 copy (`vehicle-hud-unity-x86`) still
+    has the splash on; no startup numbers here come from it.
+
+    The splash-off session on the Pixel also re-ran the HUD and memory
+    checks: HUD cold start 231–294 ms (median 239), PSS 96 MB with the HUD
+    and 210 MB with Unity open (graphics 69 MB, Unity's GL mtrack 37.6 MB
+    instead of 52.3 MB). The HUD's own start doesn't involve Unity, so that
+    difference isn't the splash; the memory numbers are one sample each, so
+    I'm not claiming a cause. On the Pixel, the EGL buffers with Unity open
+    are 31.1 MB in both sessions: exactly three 1080×2400 RGBA buffers, so
+    Unity's surface is triple-buffered. The `:telemetry` process adds 27 MB
+    of its own.
   - **GPU time per frame, from the GPU driver.** Perfetto's
     `gpu.renderstages` data source on the Pixel 6a (Mali-G78), after `adb
     shell setprop debug.graphics.gpu.profiler.perfetto 1`; the GPU counter
