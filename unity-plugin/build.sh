@@ -19,6 +19,7 @@ mkdir -p "$OUT_DIR" "$GEN_DIR" "$DEST_DIR"
 # Vulkan: SPIR-V as C array initializers.
 "$GLSLC" -mfmt=c -o "$GEN_DIR/dial.vert.spv.inc" "$HERE/shaders/dial.vert"
 "$GLSLC" -mfmt=c -o "$GEN_DIR/dial.frag.spv.inc" "$HERE/shaders/dial.frag"
+"$GLSLC" -mfmt=c -o "$GEN_DIR/dial.comp.spv.inc" "$HERE/shaders/dial.comp"
 # GLES: the same dial geometry, as a raw string compiled at runtime.
 { echo 'R"glsl('; cat "$HERE/shaders/dial_body.glsl"; echo ')glsl"'; } > "$GEN_DIR/dial_body.glsl.inc"
 

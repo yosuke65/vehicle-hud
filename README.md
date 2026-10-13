@@ -826,10 +826,8 @@ Nine genuine, specific stories from this project, not generic claims:
     one GLSL file, `unity-plugin/shaders/dial_body.glsl`, shared by both
     paths: each vertex is built from its index, so there's no vertex buffer.
     `build.sh` compiles it to SPIR-V with the NDK's `glslc` for Vulkan, and
-    embeds it as source for GLES. C# sets the needle value and the screen
-    size on Unity's main thread (`HudGfx_SetDial`, atomics); the render
-    thread reads them when it draws. The needle is a slow sweep, not tied to
-    vehicle speed yet.
+    embeds it as source for GLES. (The first version's needle was a slow
+    sweep set from C#; see the next two bullets for real speed.)
     - Vulkan: `ConfigureEvent` asks Unity to be inside a render pass when
       the event runs (`EnsureInside`, plus `ModifiesCommandBuffersState`
       because the plugin binds its own pipeline). `CommandRecordingState`
@@ -847,6 +845,39 @@ Nine genuine, specific stories from this project, not generic claims:
       The scene under the dial looks the same on both. A GLES-only export
       method, `ConfigureAndroidExportGlesAndBuild`, tests the GLES path now
       that the Pixel 6a is on the Vulkan allow list.
+  - **Needle on the app's vehicle speed (same day).** `UnityDialBridge`
+    (Kotlin) is a `TelemetryConsumer`: it loads `libhudgfx` and calls
+    `nativeSetSpeedKph` over JNI from the telemetry thread, which stores an
+    atomic that the render thread reads (0–180 km/h, the native HUD's full
+    scale, eased with a 0.12 s time constant because samples come at about
+    10 Hz). The JNI side and Unity's `UnityPluginLoad` log the same address
+    for that atomic, so it's one library instance. The speed source used to
+    stop in `MainActivity.onStop`, which runs as soon as Unity's activity
+    covers it; it now runs while any of the app's activities is started
+    (`ActivityLifecycleCallbacks`). Checked by screenshots taken right after
+    a speed log line: 59.7 km/h on the 60 tick, 43.6 between 30 and 60. On a
+    phone the speed comes from the in-app AIDL service; on AAOS the same
+    router is fed by `CarPropertyManager`, but Unity doesn't run on the
+    x86_64 Cuttlefish build, so that end-to-end path isn't verified.
+  - **Drawing into a Unity texture (same day).** C# creates a 512×512
+    `RenderTexture` (`enableRandomWrite`), passes `GetNativeTexturePtr()` to
+    the plugin, and shows it on a world-space panel above the car. Event 2
+    runs in `Update`, before the scene renders.
+    - Vulkan: the first try began the plugin's own render pass. Even with
+      `EnsureOutside`, Unity handed over a **secondary** command buffer
+      (logged), and `vkCmdBeginRenderPass` needs a primary one. So the
+      texture path is a compute shader (`shaders/dial.comp`, same layout as
+      the vertex dial, drawn as distance fields): `AccessTexture` moves the
+      image to `GENERAL` for a compute-shader write and records the barrier,
+      then the plugin binds a storage-image descriptor and dispatches 64×64
+      groups into Unity's command buffer. Log: VkImage format 37
+      (R8G8B8A8_UNORM), usage 0x9f (includes storage). The first screenshot
+      showed the dial upside down; flipping y in the compute pass fixed it.
+    - GLES: the vertex dial drawn into the texture through an FBO, with the
+      previous framebuffer and clear color restored. `glGetError` 0.
+    - Screenshots: `unity_plugin_dial_texture_vulkan.png`,
+      `unity_plugin_dial_texture_gles.png` (overlay top left, texture panel
+      above the car).
 
 ## Build
 

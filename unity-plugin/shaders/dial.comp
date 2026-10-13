@@ -1,0 +1,59 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Draws the dial straight into a Unity RenderTexture used as a storage
+// image. Unity records plugin events into secondary command buffers, where a
+// classic render pass can't begin, but a dispatch outside a render pass is
+// fine. Same layout and colors as the vertex path in dial_body.glsl, drawn
+// as distance fields with a one-pixel soft edge.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D dialImage;
+
+layout(push_constant) uniform Dial {
+    float value;   // 0..1
+    float radius;  // dial radius as a fraction of half the texture
+    float yFlip;   // 1: dial upright when row 0 is the top row as sampled
+} dial;
+
+#include "dial_body.glsl"
+
+const vec3 kBackground = vec3(0.06, 0.08, 0.10);
+
+// Distance to a segment from a to b whose half-width goes from wa to wb.
+float taperedSegment(vec2 p, vec2 a, vec2 b, float wa, float wb) {
+    vec2 ab = b - a;
+    float t = clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0);
+    return length(p - (a + ab * t)) - mix(wa, wb, t);
+}
+
+void main() {
+    ivec2 size = imageSize(dialImage);
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= size.x || px.y >= size.y) return;
+
+    // Pixel center in dial units (radius 1), y up.
+    vec2 uv = (vec2(px) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec2 p = vec2(uv.x, -uv.y * dial.yFlip) / dial.radius;
+    float pixel = 2.0 / (float(size.y) * dial.radius);
+
+    vec3 color = kBackground;
+    // Ticks: the same 7 marks as dialPoint(), from radius 0.78 to 0.95.
+    float tickDist = 1e6;
+    for (int i = 0; i < kTicks; ++i) {
+        float a = kStartAngle - kSweep * float(i) / float(kTicks - 1);
+        vec2 dir = vec2(cos(a), sin(a));
+        tickDist = min(tickDist, taperedSegment(p, dir * 0.78, dir * 0.95, 0.025, 0.025));
+    }
+    color = mix(kTickColor, color, smoothstep(-pixel, pixel, tickDist));
+    // Needle: base half-width 0.045 at the center, tip at 0.88.
+    float a = kStartAngle - kSweep * clamp(dial.value, 0.0, 1.0);
+    float needleDist = taperedSegment(p, vec2(0.0), vec2(cos(a), sin(a)) * 0.88, 0.045, 0.0);
+    color = mix(kNeedleColor, color, smoothstep(-pixel, pixel, needleDist));
+    // Hub: a 0.12 square.
+    vec2 q = abs(p) - vec2(0.06);
+    float hubDist = max(q.x, q.y);
+    color = mix(kTickColor, color, smoothstep(-pixel, pixel, hubDist));
+
+    imageStore(dialImage, px, vec4(color, 1.0));
+}

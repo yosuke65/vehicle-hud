@@ -1,6 +1,8 @@
 package dev.yosukesakurai.vehiclehud
 
+import android.app.Activity
 import android.app.ActivityOptions
+import android.app.Application
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -30,6 +32,27 @@ class MainActivity : ComponentActivity() {
     }
 
     private val telemetryRouter = TelemetryRouter()
+
+    // Speed keeps flowing while any of this app's activities is started, not
+    // just this one: Unity's UnityPlayerGameActivity covers MainActivity and
+    // draws the speed dial through libhudgfx, so stopping in our own onStop
+    // would freeze the needle the moment Unity opens.
+    private var startedActivities = 0
+    private val speedLifecycle = object : Application.ActivityLifecycleCallbacks {
+        override fun onActivityStarted(activity: Activity) {
+            if (startedActivities++ == 0) startSpeedSource()
+        }
+
+        override fun onActivityStopped(activity: Activity) {
+            if (--startedActivities == 0) stopSpeedSource()
+        }
+
+        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+        override fun onActivityResumed(activity: Activity) {}
+        override fun onActivityPaused(activity: Activity) {}
+        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+        override fun onActivityDestroyed(activity: Activity) {}
+    }
     private var secondaryDisplayMode = SecondaryDisplayMode.HUD
 
     private val displayTracker by lazy {
@@ -54,6 +77,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         hudView = HudSurfaceView(this)
         telemetryRouter.add(hudView)
+        telemetryRouter.add(UnityDialBridge)
+        // Registered before onStart, so this activity's own start counts.
+        application.registerActivityLifecycleCallbacks(speedLifecycle)
 
         // Phase 3: tap the HUD to open the separate Vulkan triangle
         // activity. Phase 4: long-press to open the embedded Unity view
@@ -116,6 +142,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        application.unregisterActivityLifecycleCallbacks(speedLifecycle)
+        if (startedActivities > 0) stopSpeedSource()
         ModeSwitchReceiver.callback = null
         super.onDestroy()
     }
@@ -138,7 +166,6 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         displayTracker.start()
-        startSpeedSource()
         if (!displayTracker.hasSecondaryDisplay()) {
             Toast.makeText(
                 this,
@@ -149,7 +176,6 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        stopSpeedSource()
         displayTracker.stop()
         super.onStop()
     }
