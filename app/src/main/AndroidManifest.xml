@@ -37,6 +37,24 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- See UnityPlayerGameActivity below. -->
+            <meta-data android:name="distractionOptimized" android:value="true" />
+        </activity>
+        <!-- Declared in unityLibrary's own manifest; merged here only to add
+             the distraction-optimized flag. On a car, CarPackageManagerService
+             covers any activity on a restricted display (the driver's
+             cluster) with SystemUI's ActivityBlockingActivity unless it's
+             distraction-optimized, and it only trusts this declaration from
+             system apps, which the priv-app install is. A real app would
+             also have to meet the driver-distraction guidelines.
+             Its own taskAffinity: the activity is singleTask, so with the
+             app's default affinity a launch onto the cluster would reuse the
+             HUD's task and could move the HUD off the center display. -->
+        <activity
+            android:name="com.unity3d.player.UnityPlayerGameActivity"
+            android:taskAffinity="dev.yosukesakurai.vehiclehud.unity"
+            tools:node="merge">
+            <meta-data android:name="distractionOptimized" android:value="true" />
         </activity>
         <activity
             android:name=".VulkanActivity"

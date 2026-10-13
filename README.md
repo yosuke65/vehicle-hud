@@ -929,6 +929,82 @@ Nine genuine, specific stories from this project, not generic claims:
         -PunityExportDir=../vehicle-hud-unity-x86/Builds/AndroidExport
     ```
 
+- **Phase 12 (2026-10-13, night) — closing the open items.**
+  - **Binder callbacks instead of polling.** `TelemetryService` pushes each
+    sample to registered listeners through a oneway `ITelemetryListener`,
+    kept in a `RemoteCallbackList` (which drops listeners whose process
+    died). `registerListener`/`unregisterListener` are oneway too, so the UI
+    thread never waits on the `:telemetry` process. `MainActivity` links to
+    the service's death. Kill test on the AAOS emulator (CAR_SPEED revoked
+    and user-fixed, so the AIDL path runs; `kill -9` on the `:telemetry`
+    process three times): `binderDied` arrived in the same millisecond as
+    ActivityManager's "has died", and ActivityManager logged "Scheduling
+    restart of crashed service ... in 1000ms", then 4000ms, then 16000ms. The
+    first sample from the restarted service came 1,239 ms, 4,241 ms and
+    16,231 ms after `binderDied`. The restart back-off grows four times per
+    crash, so a car HMI can't just wait for the restart: it has to show that
+    the value is stale.
+  - **Live needle in the native Vulkan renderer.** The Phase 3 triangle is
+    gone; the renderer draws the speed dial with the Unity plugin's shaders
+    (`unity-plugin/shaders/dial.*`, compiled with `glslc` into
+    `assets/shaders/dial.*.spv`). The needle value is a push constant, so the
+    command buffer for each swapchain image is re-recorded every frame (pool
+    created with `RESET_COMMAND_BUFFER_BIT`, buffers begun with
+    `ONE_TIME_SUBMIT`). Speed reaches it through a process-wide atomic, set
+    by `VulkanSurfaceView` from the now process-wide `TelemetryRouter.shared`.
+    On the AAOS emulator, 10 m/s in the Vehicle HAL showed 36 km/h and
+    45 m/s showed 162 km/h (`vulkan_needle_aaos_emulator.png`), at 60.7 fps.
+  - **Startup and memory.** `am start -S -W` for the HUD, then a long-press
+    into Unity, then `dumpsys meminfo`:
+
+    | | Pixel 6a | AAOS emulator (M5 Mac) |
+    |---|---|---|
+    | HUD cold start (5 runs) | 303–590 ms, median 365 | 207–222 ms, median 217 |
+    | Unity "Displayed" | +173 ms | +151 ms |
+    | Unity activity start → first plugin frame | 2,623 ms | 2,609 ms |
+    | PSS, HUD only | 92 MB (graphics 44 MB) | 51 MB |
+    | PSS, Unity open | 229 MB (graphics 83 MB) | 163 MB |
+
+    "Displayed" only means the activity's window drew a frame. Unity's
+    engine needed another ~2.4 s before its first real frame, so engine
+    startup has to be measured at the first engine frame. On the Pixel, the
+    EGL buffers with Unity open are 31.1 MB: exactly three 1080×2400 RGBA
+    buffers, so Unity's surface is triple-buffered. The `:telemetry`
+    process adds 27 MB of its own.
+  - **GPU time per frame, from the GPU driver.** Perfetto's
+    `gpu.renderstages` data source on the Pixel 6a (Mali-G78), after `adb
+    shell setprop debug.graphics.gpu.profiler.perfetto 1`; the GPU counter
+    data source didn't register. 6 s traces:
+    - GLES HUD: per frame ~105 µs non-fragment (vertex/tiling) + ~122 µs
+      fragment, so ~0.23 ms of GPU time at 60 fps.
+    - Native Vulkan dial: ~95 µs + ~280 µs per frame, cycling through 4
+      render targets (the 4 swapchain images). The fragment pass starts
+      about 2 ms after binning ends: the submit waits on the acquired image
+      only at the color-output stage, so binning starts before the image is
+      free.
+    - Unity (Vulkan): one frame every ~33 ms, with a ~680 µs fragment pass on
+      the swapchain image plus two jobs with no render target (~65–75 µs
+      and ~315 µs); the plugin's compute dispatch is one of them, but the
+      trace doesn't say which. ~1.3 ms of GPU time per frame.
+    None of the three is GPU-bound; the earlier frame-pacing problem was on
+    the CPU side.
+  - **HWC and Gralloc on the self-built Cuttlefish.** With the `ranchu`
+    HWC, every layer on both displays is DEVICE. Gralloc pads the 1080-wide
+    client target to stride 1088 (same as the Pixel) and the 400-wide
+    cluster to 448; there are two client-target buffers per display
+    (`NUM_FRAMEBUFFER_SURFACE_BUFFERS=2`) instead of the Pixel's three.
+    The HUD is portrait-locked, so on the landscape 1080×600 cockpit display
+    the window manager letterboxes it (a 333×600 window plus a solid-color
+    letterbox layer). Unity's layer carries an explicit 30 fps frame-rate
+    vote, matching its 30 render events per second.
+  - **Unity on Vulkan beyond the Pixel.** On the AAOS emulator (Vulkan device
+    "Apple M5", the Mac GPU passed through, Vulkan 1.3) Unity 6.5 runs on
+    Vulkan with both plugin paths, after adding the emulator to the Vulkan
+    allow list. On the self-built Cuttlefish, Unity 6.0 refuses SwiftShader's
+    Vulkan ("Your device does not match the hardware requirements", then
+    "Unable to initialize the Unity Engine Graphics API"), even with an
+    allow-list entry; GLES works there.
+
 ## Build
 
 ```
