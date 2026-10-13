@@ -821,6 +821,32 @@ Nine genuine, specific stories from this project, not generic claims:
     scene doesn't set `Application.targetFrameRate`.
   - Unity's batch build stops the adb server, so reconnect adb before
     installing.
+  - **Drawing (added the same day).** The plugin draws a speed dial (7 ticks,
+    a needle, a hub; 51 vertices) on top of Unity's frame. The geometry is
+    one GLSL file, `unity-plugin/shaders/dial_body.glsl`, shared by both
+    paths: each vertex is built from its index, so there's no vertex buffer.
+    `build.sh` compiles it to SPIR-V with the NDK's `glslc` for Vulkan, and
+    embeds it as source for GLES. C# sets the needle value and the screen
+    size on Unity's main thread (`HudGfx_SetDial`, atomics); the render
+    thread reads them when it draws. The needle is a slow sweep, not tied to
+    vehicle speed yet.
+    - Vulkan: `ConfigureEvent` asks Unity to be inside a render pass when
+      the event runs (`EnsureInside`, plus `ModifiesCommandBuffersState`
+      because the plugin binds its own pipeline). `CommandRecordingState`
+      gives Unity's command buffer, render pass and subpass; the plugin
+      builds one pipeline per render pass, then pushes constants and draws.
+      Log: pipeline created for Unity's render pass, subpass 0, and the draw
+      recorded into a *secondary* command buffer (level 1), 1080×2400.
+    - GLES: the same draw with Unity's context on its render thread. GL
+      objects are created lazily there (the device-initialize callback runs
+      on the main thread, which doesn't own the context), and every state
+      the draw changes (program, VAO, viewport, depth, cull, blend, scissor)
+      is put back, because Unity caches GL state. `glGetError` 0 after the
+      first draw.
+    - Screenshots: `unity_plugin_dial_vulkan.png`, `unity_plugin_dial_gles.png`.
+      The scene under the dial looks the same on both. A GLES-only export
+      method, `ConfigureAndroidExportGlesAndBuild`, tests the GLES path now
+      that the Pixel 6a is on the Vulkan allow list.
 
 ## Build
 

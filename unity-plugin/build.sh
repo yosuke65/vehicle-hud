@@ -9,14 +9,23 @@ UNITY_PROJECT="${UNITY_PROJECT:-$HOME/Desktop/development/vehicle-hud-unity}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CXX="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android26-clang++"
+GLSLC="$NDK/shader-tools/darwin-x86_64/glslc"
 OUT_DIR="$HERE/build/arm64-v8a"
+GEN_DIR="$HERE/build/generated"
 DEST_DIR="$UNITY_PROJECT/Assets/Plugins/Android/libs/arm64-v8a"
 
-mkdir -p "$OUT_DIR" "$DEST_DIR"
+mkdir -p "$OUT_DIR" "$GEN_DIR" "$DEST_DIR"
+
+# Vulkan: SPIR-V as C array initializers.
+"$GLSLC" -mfmt=c -o "$GEN_DIR/dial.vert.spv.inc" "$HERE/shaders/dial.vert"
+"$GLSLC" -mfmt=c -o "$GEN_DIR/dial.frag.spv.inc" "$HERE/shaders/dial.frag"
+# GLES: the same dial geometry, as a raw string compiled at runtime.
+{ echo 'R"glsl('; cat "$HERE/shaders/dial_body.glsl"; echo ')glsl"'; } > "$GEN_DIR/dial_body.glsl.inc"
+
 "$CXX" -shared -fPIC -O2 -std=c++17 -Wall -Wextra \
-    -I "$UNITY_PLUGIN_API" \
+    -I "$UNITY_PLUGIN_API" -I "$GEN_DIR" \
     -static-libstdc++ \
     -o "$OUT_DIR/libhudgfx.so" "$HERE/hudgfx.cpp" \
-    -llog
+    -lGLESv3 -llog
 cp "$OUT_DIR/libhudgfx.so" "$DEST_DIR/libhudgfx.so"
 echo "Built $OUT_DIR/libhudgfx.so -> $DEST_DIR"
