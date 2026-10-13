@@ -794,6 +794,34 @@ Nine genuine, specific stories from this project, not generic claims:
     Tested with `adb shell wm size 1080x1800` and `wm size reset`: rebuilt
     1080×2400 → 1080×1800 → 1080×2400 at about 60 fps.
 
+- **Phase 11 (done, verified on-device) — a Unity native rendering plugin.**
+  `unity-plugin/hudgfx.cpp` builds into `libhudgfx.so` (`unity-plugin/build.sh`,
+  NDK clang, Unity's `PluginAPI` headers) and goes into the Unity project's
+  `Assets/Plugins/Android/libs/arm64-v8a/`. Unity calls `UnityPluginLoad`,
+  the plugin registers for graphics device events through `IUnityGraphics`,
+  and on Vulkan it reads Unity's own `VkInstance`/`VkPhysicalDevice` through
+  `IUnityGraphicsVulkan`. `HudGfxBridge.cs` (in the Unity project) calls
+  `GL.IssuePluginEvent` once per frame. Results on the Pixel 6a:
+  - With the graphics API on Automatic, Unity picked **OpenGL ES 3**, even
+    though the device reports Vulkan 1.4.305 on a Mali-G78 and our own Vulkan
+    renderer runs at 60 fps. Unity's docs say it doesn't allow Pixel 6
+    devices to use Vulkan by default.
+  - Vulkan-only without an allow-list entry: Unity shows "Your device does
+    not match the hardware requirements", then "Unable to initialize the
+    Unity Engine Graphics API".
+  - Vulkan-only with an allow-list entry (`google` / `bluejay` / `Mali-G78`,
+    added by `SceneSetup.ConfigureAndroidExportVulkanAndBuild`): Unity starts
+    on Vulkan, and the plugin logs `Unity Vulkan device: Mali-G78, API
+    1.4.305, queue family 0`.
+  - Threads: `UnityPluginLoad` and the device-initialize event run on
+    "Unity Main Thread"; render events run on "UnityGfxDeviceWorker", a
+    separate thread, on both GLES and Vulkan. That's why plugin GPU work
+    goes through `GL.IssuePluginEvent` and not a direct call from C#.
+  - About 30 render events per second in both runs (300 every ~10 s). The
+    scene doesn't set `Application.targetFrameRate`.
+  - Unity's batch build stops the adb server, so reconnect adb before
+    installing.
+
 ## Build
 
 ```
