@@ -1,10 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Android Automotive only: read speed from the Vehicle HAL. Optional,
          so the same APK still installs and runs on a phone. -->
     <uses-feature android:name="android.hardware.type.automotive" android:required="false" />
     <uses-permission android:name="android.car.permission.CAR_SPEED" />
+
+    <!-- Only granted when the HUD is installed as a platform-signed priv-app
+         in the AAOS image (vendor/yosuke/vehiclehud in the AOSP tree). Used to
+         find the private instrument-cluster display and launch Unity on it.
+         A normal install just doesn't get them, and the HUD falls back. -->
+    <uses-permission android:name="android.car.permission.ACCESS_PRIVATE_DISPLAY_ID" />
+    <uses-permission
+        android:name="android.permission.INTERNAL_SYSTEM_WINDOW"
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:allowBackup="true"

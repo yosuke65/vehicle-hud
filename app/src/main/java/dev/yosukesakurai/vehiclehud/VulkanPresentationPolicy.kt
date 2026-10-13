@@ -5,7 +5,7 @@ import android.content.Context
 import android.view.Display
 
 /**
- * Alternative secondary-display policy: show the Vulkan triangle renderer.
+ * Alternative secondary-display policy: show the Vulkan speed-dial renderer.
  */
 class VulkanPresentationPolicy(
     private val context: Context,

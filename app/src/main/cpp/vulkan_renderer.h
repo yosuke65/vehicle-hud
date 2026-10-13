@@ -7,22 +7,21 @@
 #include <vulkan/vulkan.h>
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 
-// A minimal Vulkan triangle renderer, kept deliberately separate from the
-// EGL/GLES RenderThread — this is Phase 3 research (comparing Vulkan's
-// explicit model against the GLES path already built), not a replacement
-// for it, and keeping it isolated means a Vulkan setup mistake can't
-// jeopardize the working GLES app.
+// A Vulkan speed-dial renderer, kept deliberately separate from the
+// EGL/GLES RenderThread. It started as Phase 3's triangle (comparing
+// Vulkan's explicit model against the GLES path), and now draws the live
+// needle: ticks, needle and hub, using the same dial shaders as the Unity
+// plugin (unity-plugin/shaders, compiled to assets/shaders/dial.*.spv).
 //
 // Runs its own dedicated thread, same discipline as RenderThread: every
 // Vulkan call happens on that one thread, created and torn down there.
-// Vertex positions are hardcoded in the vertex shader (see
-// shaders/triangle.vert) via gl_VertexIndex — deliberate scope control that
-// skips VkBuffer/VkDeviceMemory allocation while still exercising the full
-// real pipeline: instance, physical/logical device, surface, swapchain,
-// render pass, pipeline, command buffers, and present synchronization.
+// Vertices are built in the vertex shader from gl_VertexIndex, so there's
+// no VkBuffer. The needle value goes in as a push constant, so the command
+// buffer for each swapchain image is re-recorded every frame.
 class VulkanRenderer {
 public:
     VulkanRenderer(ANativeWindow* window, AAssetManager* assetManager);
@@ -37,6 +36,11 @@ public:
     // Called from the UI thread (SurfaceHolder.Callback.surfaceChanged).
     // Only sets a flag; the render thread rebuilds the swapchain itself.
     void notifySurfaceChanged();
+
+    // Latest vehicle speed for the needle, from the app's telemetry thread.
+    // Process-wide (an atomic, not a member), so a late telemetry call can't
+    // touch a renderer that the UI thread is destroying.
+    static void setSpeedKph(float kph);
 
 private:
     // Two frames in flight: the CPU can prepare frame N+1 while the GPU
@@ -60,6 +64,8 @@ private:
     bool createFramebuffers();
     bool createCommandPool();
     bool createCommandBuffers();
+    bool recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex, float needleValue);
+    float needleValue();
     bool createSyncObjects();
     bool createRenderFinishedSemaphores();
 
@@ -110,4 +116,9 @@ private:
     // (an image can come back while an older slot still renders to it).
     std::vector<VkSemaphore> renderFinished_;
     std::vector<VkFence> imagesInFlight_;
+
+    // Needle position 0..1, eased toward the latest speed (render thread only).
+    float shownNeedle_ = 0.0f;
+    std::chrono::steady_clock::time_point lastNeedleTime_ = std::chrono::steady_clock::now();
+    bool loggedLiveSpeed_ = false;
 };

@@ -3,6 +3,8 @@ package dev.yosukesakurai.vehiclehud
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
+import android.os.RemoteCallbackList
+import android.os.RemoteException
 import android.util.Log
 import kotlin.concurrent.thread
 import kotlin.math.sin
@@ -14,6 +16,9 @@ import kotlin.math.sin
  * telemetry, independent of the native TelemetrySource — a real HAL
  * client in this position wouldn't know or care that anything else also
  * has its own generator; it only sees whatever this service reports.
+ *
+ * Pushes every sample to registered ITelemetryListeners (oneway calls), so
+ * clients don't poll.
  */
 class TelemetryService : Service() {
 
@@ -38,9 +43,24 @@ class TelemetryService : Service() {
 
     @Volatile private var running = false
 
+    // Tracks client listeners across processes. It links to each listener's
+    // death, so a client process that dies is dropped without its own
+    // unregister call.
+    private val listeners = RemoteCallbackList<ITelemetryListener>()
+
     private val binder = object : ITelemetryService.Stub() {
         override fun getSpeedKph(): Float = currentSpeedKph
         override fun getRpm(): Float = currentRpm
+
+        override fun registerListener(listener: ITelemetryListener) {
+            listeners.register(listener)
+            Log.i(TAG, "Listener registered; ${listeners.registeredCallbackCount} now")
+        }
+
+        override fun unregisterListener(listener: ITelemetryListener) {
+            listeners.unregister(listener)
+            Log.i(TAG, "Listener unregistered; ${listeners.registeredCallbackCount} now")
+        }
     }
 
     override fun onCreate() {
@@ -54,16 +74,35 @@ class TelemetryService : Service() {
                 // takes over the needle instead of the native fake one.
                 currentSpeedKph = (sin(elapsed * 0.6f) * 0.5f + 0.5f) * 180f
                 currentRpm = (sin(elapsed * 1.3f + 0.5f) * 0.5f + 0.5f) * 6000f
+                broadcast(currentSpeedKph, currentRpm)
                 Thread.sleep(100) // ~10Hz, matches the native cadence
             }
         }
         Log.i(TAG, "TelemetryService created in pid=${android.os.Process.myPid()}")
     }
 
+    // Only the generator thread broadcasts: RemoteCallbackList allows one
+    // broadcast at a time.
+    private fun broadcast(speedKph: Float, rpm: Float) {
+        val count = listeners.beginBroadcast()
+        try {
+            for (i in 0 until count) {
+                try {
+                    listeners.getBroadcastItem(i).onTelemetry(speedKph, rpm)
+                } catch (e: RemoteException) {
+                    // The client died; RemoteCallbackList removes it.
+                }
+            }
+        } finally {
+            listeners.finishBroadcast()
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
         running = false
+        listeners.kill()
         super.onDestroy()
     }
 

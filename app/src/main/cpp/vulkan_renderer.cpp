@@ -4,11 +4,37 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 
 #define LOG_TAG "VehicleHud"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+namespace {
+
+// Written by the telemetry thread, read by the render thread.
+std::atomic<float> g_speedKph{0.0f};
+
+constexpr uint32_t kDialVertexCount = 7 * 6 + 3 + 6;  // kVertexCount in dial_body.glsl
+constexpr float kMaxSpeedKph = 180.0f;                // same full scale as the GLES gauge
+constexpr float kNeedleTauSeconds = 0.12f;            // speed arrives at ~10 Hz
+constexpr float kDialRadius = 0.38f;                  // NDC units, vertical
+
+// Push constants of shaders/dial.vert (std430: vec2, then four floats).
+struct DialParams {
+    float centerX, centerY;
+    float radius;
+    float aspect;
+    float value;
+    float yFlip;
+};
+
+}  // namespace
+
+void VulkanRenderer::setSpeedKph(float kph) {
+    g_speedKph.store(kph);
+}
 
 VulkanRenderer::VulkanRenderer(ANativeWindow* window, AAssetManager* assetManager)
     : window_(window), assetManager_(assetManager) {}
@@ -350,8 +376,11 @@ VkShaderModule VulkanRenderer::createShaderModule(const std::vector<uint8_t>& co
 }
 
 bool VulkanRenderer::createGraphicsPipeline() {
-    auto vertCode = loadShaderAsset("shaders/triangle.vert.spv");
-    auto fragCode = loadShaderAsset("shaders/triangle.frag.spv");
+    // Compiled from unity-plugin/shaders with the NDK's glslc:
+    //   glslc unity-plugin/shaders/dial.vert -o app/src/main/assets/shaders/dial.vert.spv
+    //   glslc unity-plugin/shaders/dial.frag -o app/src/main/assets/shaders/dial.frag.spv
+    auto vertCode = loadShaderAsset("shaders/dial.vert.spv");
+    auto fragCode = loadShaderAsset("shaders/dial.frag.spv");
     if (vertCode.empty() || fragCode.empty()) {
         return false;
     }
@@ -377,7 +406,7 @@ bool VulkanRenderer::createGraphicsPipeline() {
     VkPipelineShaderStageCreateInfo stages[] = {vertStage, fragStage};
 
     // No vertex bindings/attributes: positions come from gl_VertexIndex in
-    // the shader itself, not a bound VkBuffer (see shaders/triangle.vert).
+    // the shader itself, not a bound VkBuffer (see dial_body.glsl).
     VkPipelineVertexInputStateCreateInfo vertexInput{};
     vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
 
@@ -421,8 +450,12 @@ bool VulkanRenderer::createGraphicsPipeline() {
     colorBlending.attachmentCount = 1;
     colorBlending.pAttachments = &colorBlendAttachment;
 
+    // The dial's placement and the needle value, pushed with every frame.
+    VkPushConstantRange pushRange{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(DialParams)};
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushRange;
     if (vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &pipelineLayout_) != VK_SUCCESS) {
         LOGE("vkCreatePipelineLayout failed");
         vkDestroyShaderModule(device_, vertModule, nullptr);
@@ -485,6 +518,9 @@ bool VulkanRenderer::createFramebuffers() {
 bool VulkanRenderer::createCommandPool() {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    // Each command buffer is re-recorded every frame, so it must be
+    // resettable on its own.
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = queueFamilyIndex_;
 
     if (vkCreateCommandPool(device_, &poolInfo, nullptr, &commandPool_) != VK_SUCCESS) {
@@ -506,11 +542,44 @@ bool VulkanRenderer::createCommandBuffers() {
         LOGE("vkAllocateCommandBuffers failed");
         return false;
     }
+    // Recorded in drawFrame(), once the image is acquired and its previous
+    // submission has finished.
+    return true;
+}
 
-    // The scene never changes, so — unlike the GLES render loop, which
-    // re-issues its (now minimal) per-frame GL calls every frame — these
-    // command buffers are recorded once per swapchain, not per frame.
+float VulkanRenderer::needleValue() {
+    const auto now = std::chrono::steady_clock::now();
+    const float dt = std::chrono::duration<float>(now - lastNeedleTime_).count();
+    lastNeedleTime_ = now;
+    const float speed = g_speedKph.load();
+    if (!loggedLiveSpeed_ && speed > 0.0f) {
+        loggedLiveSpeed_ = true;
+        LOGI("Vulkan needle: first live speed %.1f km/h", speed);
+    }
+    const float target = std::clamp(speed / kMaxSpeedKph, 0.0f, 1.0f);
+    shownNeedle_ += (target - shownNeedle_) * (1.0f - std::exp(-dt / kNeedleTauSeconds));
+    return shownNeedle_;
+}
+
+bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex, float needleValue) {
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    // Beginning implicitly resets it (the pool allows per-buffer reset).
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+        LOGE("vkBeginCommandBuffer failed for image %u", imageIndex);
+        return false;
+    }
+
     VkClearValue clearColor = {{{0.05f, 0.07f, 0.09f, 1.0f}}};
+    VkRenderPassBeginInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    renderPassInfo.renderPass = renderPass_;
+    renderPassInfo.framebuffer = framebuffers_[imageIndex];
+    renderPassInfo.renderArea.offset = {0, 0};
+    renderPassInfo.renderArea.extent = swapchainExtent_;
+    renderPassInfo.clearValueCount = 1;
+    renderPassInfo.pClearValues = &clearColor;
 
     VkViewport viewport{};
     viewport.width = static_cast<float>(swapchainExtent_.width);
@@ -519,34 +588,22 @@ bool VulkanRenderer::createCommandBuffers() {
     VkRect2D scissor{};
     scissor.extent = swapchainExtent_;
 
-    for (size_t i = 0; i < commandBuffers_.size(); ++i) {
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        if (vkBeginCommandBuffer(commandBuffers_[i], &beginInfo) != VK_SUCCESS) {
-            LOGE("vkBeginCommandBuffer failed for buffer %zu", i);
-            return false;
-        }
+    // Centered dial; Vulkan's NDC y points down, hence yFlip -1.
+    const DialParams params{0.0f, 0.0f, kDialRadius,
+                            static_cast<float>(swapchainExtent_.width) / static_cast<float>(swapchainExtent_.height),
+                            needleValue, -1.0f};
 
-        VkRenderPassBeginInfo renderPassInfo{};
-        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        renderPassInfo.renderPass = renderPass_;
-        renderPassInfo.framebuffer = framebuffers_[i];
-        renderPassInfo.renderArea.offset = {0, 0};
-        renderPassInfo.renderArea.extent = swapchainExtent_;
-        renderPassInfo.clearValueCount = 1;
-        renderPassInfo.pClearValues = &clearColor;
+    vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(params), &params);
+    vkCmdDraw(commandBuffer, kDialVertexCount, 1, 0, 0);
+    vkCmdEndRenderPass(commandBuffer);
 
-        vkCmdBeginRenderPass(commandBuffers_[i], &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdBindPipeline(commandBuffers_[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-        vkCmdSetViewport(commandBuffers_[i], 0, 1, &viewport);
-        vkCmdSetScissor(commandBuffers_[i], 0, 1, &scissor);
-        vkCmdDraw(commandBuffers_[i], 3, 1, 0, 0);
-        vkCmdEndRenderPass(commandBuffers_[i]);
-
-        if (vkEndCommandBuffer(commandBuffers_[i]) != VK_SUCCESS) {
-            LOGE("vkEndCommandBuffer failed for buffer %zu", i);
-            return false;
-        }
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+        LOGE("vkEndCommandBuffer failed for image %u", imageIndex);
+        return false;
     }
     return true;
 }
@@ -722,6 +779,12 @@ bool VulkanRenderer::drawFrame() {
         vkWaitForFences(device_, 1, &imagesInFlight_[imageIndex], VK_TRUE, UINT64_MAX);
     }
     imagesInFlight_[imageIndex] = frameFence;
+
+    // The image's last submission is done (waited above), so its command
+    // buffer is free to re-record with this frame's needle value.
+    if (!recordCommandBuffer(commandBuffers_[imageIndex], imageIndex, needleValue())) {
+        return false;
+    }
 
     // Reset only once we're sure to submit, or the next wait on this fence
     // would block forever.

@@ -6,7 +6,7 @@ import android.os.Bundle
 import android.view.Display
 
 /**
- * Presentation that runs the isolated Vulkan triangle renderer on a secondary
+ * Presentation that runs the isolated Vulkan speed-dial renderer on a secondary
  * display. The VulkanSurfaceView creates its own native VulkanRenderer and
  * VkSurfaceKHR bound to this Presentation's window, so this exercises Vulkan's
  * Android WSI path (VK_KHR_android_surface + swapchain) on a secondary display.

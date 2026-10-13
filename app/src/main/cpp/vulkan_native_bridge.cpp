@@ -38,6 +38,14 @@ Java_dev_yosukesakurai_vehiclehud_VulkanSurfaceView_nativeSurfaceChanged(
     reinterpret_cast<VulkanRenderer*>(handle)->notifySurfaceChanged();
 }
 
+// Called on the telemetry thread. Static (no handle): it only stores the
+// speed in an atomic that every VulkanRenderer's render thread reads.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_yosukesakurai_vehiclehud_VulkanSurfaceView_nativeSetSpeedKph(
+        JNIEnv* /* env */, jclass /* clazz */, jfloat speedKph) {
+    VulkanRenderer::setSpeedKph(speedKph);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_dev_yosukesakurai_vehiclehud_VulkanSurfaceView_nativeSurfaceDestroyed(
         JNIEnv* /* env */, jobject /* thiz */, jlong handle) {
