@@ -1,0 +1,30 @@
+// Vehicle HUD (with its embedded Unity player and the libhudgfx plugin) as a
+// privileged, platform-signed app in the sdv_ivi_cf image.
+//
+// - privileged: installs to priv-app, so the privapp allowlist below can
+//   grant ACCESS_PRIVATE_DISPLAY_ID (signature|privileged). The HUD needs it
+//   to look up the driver's instrument-cluster display, which is private.
+// - certificate "platform": re-signs the APK with this build's platform key.
+//   That grants INTERNAL_SYSTEM_WINDOW (signature only), the permission
+//   ActivityTaskSupervisor checks before it lets an app launch an activity
+//   onto a private display.
+// - system_ext: OEM apps belong in system_ext (or product), not in the
+//   generic system partition.
+android_app_import {
+    name: "VehicleHud",
+    apk: "VehicleHud.apk",
+    privileged: true,
+    certificate: "platform",
+    system_ext_specific: true,
+    dex_preopt: {
+        enabled: false,
+    },
+    required: ["privapp-permissions-vehiclehud.xml"],
+}
+
+prebuilt_etc {
+    name: "privapp-permissions-vehiclehud.xml",
+    src: "privapp-permissions-vehiclehud.xml",
+    sub_dir: "permissions",
+    system_ext_specific: true,
+}

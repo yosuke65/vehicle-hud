@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Privileged permissions the Vehicle HUD may hold as a priv-app. -->
+<permissions>
+    <privapp-permissions package="dev.yosukesakurai.vehiclehud">
+        <!-- Look up the driver's instrument-cluster display, which is private. -->
+        <permission name="android.car.permission.ACCESS_PRIVATE_DISPLAY_ID"/>
+    </privapp-permissions>
+</permissions>

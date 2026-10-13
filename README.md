@@ -1039,6 +1039,30 @@ Nine genuine, specific stories from this project, not generic claims:
       the physical cluster screen. Unity's task launched there without being
       blocked, but GameActivity never got `APP_CMD_INIT_WINDOW`, so Unity
       never had a surface. Not investigated further.
+  - **The HUD as a privileged system app: first Blueprint module.**
+    `aosp-module/vendor/yosuke/vehiclehud/Android.bp` (copied into the AOSP
+    tree at `vendor/yosuke/vehiclehud/`, next to the x86_64 APK as
+    `VehicleHud.apk`): an `android_app_import` with `privileged: true`,
+    `certificate: "platform"`, `system_ext_specific: true` and dex-preopt
+    off, plus a `prebuilt_etc` privapp allowlist for
+    `ACCESS_PRIVATE_DISPLAY_ID`. OEM apps go in system_ext or product, not
+    in the generic system partition.
+    - `m VehicleHud` (`aosp-module/build_vehiclehud.sh`, same lunch target as
+      the image, `sdv_ivi_cf-aosp_current-userdebug`) took 52:41 on the
+      15 GB laptop. Nearly all of it was Soong re-analyzing the tree because
+      of the new `Android.bp`: peak RSS 13.7 GB, 42.7 million major page
+      faults, heavy swapping.
+    - Deployed into the running image without a full image build
+      (`aosp-module/deploy_vehiclehud.sh`: `adb remount`, push to
+      `/system_ext/priv-app/VehicleHud/` and `/system_ext/etc/permissions/`,
+      reboot). After boot: `pm list packages -f` shows
+      `/system_ext/priv-app/VehicleHud/VehicleHud.apk`; flags `SYSTEM`,
+      `PRIVILEGED`, `SYSTEM_EXT`; SystemConfig logged reading the allowlist;
+      the app's signature matches the platform package's; the process runs
+      in the `u:r:platform_app` SELinux domain; both permissions granted.
+    - Long-press on the center display: Unity launched on cluster display 2
+      and drew both dials at 90 km/h, the 25 m/s set in the Vehicle HAL
+      (`unity_cluster_privapp_90kmh.png`).
 
 ## Build
 
