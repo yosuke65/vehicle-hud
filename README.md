@@ -961,13 +961,18 @@ Nine genuine, specific stories from this project, not generic claims:
     |---|---|---|
     | HUD cold start (5 runs) | 303–590 ms, median 365 | 207–222 ms, median 217 |
     | Unity "Displayed" | +173 ms | +151 ms |
-    | Unity activity start → first plugin frame | 2,623 ms | 2,609 ms |
+    | Unity "Fully drawn" (reported by Unity) | +619 ms | +622 ms |
+    | Unity activity start → first plugin event | 2,623 ms | 2,609 ms |
     | PSS, HUD only | 92 MB (graphics 44 MB) | 51 MB |
     | PSS, Unity open | 229 MB (graphics 83 MB) | 163 MB |
 
-    "Displayed" only means the activity's window drew a frame. Unity's
-    engine needed another ~2.4 s before its first real frame, so engine
-    startup has to be measured at the first engine frame. On the Pixel, the
+    "Displayed" only means the activity's window drew its first frame, and
+    Unity reports "Fully drawn" at about 620 ms. The plugin bridge is
+    created right after the first scene loads
+    (`RuntimeInitializeOnLoadMethod(AfterSceneLoad)`), so its first event at
+    ~2.6 s marks when the scene was actually ready: about 2 s after Android
+    already counted the launch as finished. The startup metric that matters
+    is the first frame of the real scene. On the Pixel, the
     EGL buffers with Unity open are 31.1 MB: exactly three 1080×2400 RGBA
     buffers, so Unity's surface is triple-buffered. The `:telemetry`
     process adds 27 MB of its own.
@@ -979,9 +984,10 @@ Nine genuine, specific stories from this project, not generic claims:
       fragment, so ~0.23 ms of GPU time at 60 fps.
     - Native Vulkan dial: ~95 µs + ~280 µs per frame, cycling through 4
       render targets (the 4 swapchain images). The fragment pass starts
-      about 2 ms after binning ends: the submit waits on the acquired image
-      only at the color-output stage, so binning starts before the image is
-      free.
+      about 2 ms after binning ends. That fits the submit's wait on the
+      acquired image, which only applies at the color-output stage, so
+      binning can start before the image is free (an inference from the
+      trace, not something the trace states).
     - Unity (Vulkan): one frame every ~33 ms, with a ~680 µs fragment pass on
       the swapchain image plus two jobs with no render target (~65–75 µs
       and ~315 µs); the plugin's compute dispatch is one of them, but the
@@ -1004,6 +1010,35 @@ Nine genuine, specific stories from this project, not generic claims:
     Vulkan ("Your device does not match the hardware requirements", then
     "Unable to initialize the Unity Engine Graphics API"), even with an
     allow-list entry; GLES works there.
+  - **Unity on the driver's instrument cluster (self-built `sdv_ivi_cf`).**
+    - First try, as root: `am start --display 2` put the HUD on the
+      cluster, and Car Service covered it at once with SystemUI's
+      `ActivityBlockingActivity`. The blocking intent carried
+      `is_root_activity_do=false` and `display_id=2`: the activity wasn't
+      distraction-optimized. Fix: `distractionOptimized` meta-data on
+      `MainActivity` and, through a manifest merge, on
+      `UnityPlayerGameActivity`.
+    - Finding the cluster: `CarOccupantZoneManager.getDisplayIdForDriver(
+      DISPLAY_TYPE_INSTRUMENT_CLUSTER)`, a `@SystemApi` called by reflection,
+      which needs `ACCESS_PRIVATE_DISPLAY_ID` (signature|privileged).
+      Launching there: `setLaunchDisplayId`, which needs
+      `INTERNAL_SYSTEM_WINDOW` (signature only) for a private display.
+      Unity's activity is singleTask, so it got its own `taskAffinity`;
+      otherwise the launch would reuse the HUD's task.
+    - Signing: the self-built image and Google's emulator image both use the
+      AOSP test platform key (certificate SHA-256 `c8a2e9bc…`). Signed with
+      `build/make/target/product/security/platform.pk8`, the APK got both
+      permissions even as a normal install.
+    - Result: "Driver instrument-cluster display: 2", "Launched Unity on
+      display 2", Unity's own task on display 2, and the plugin drawing both
+      dials at 400×600 at 54 km/h from the image's Vehicle HAL, with no
+      blocking screen (`unity_cluster_sdv_ivi_cf.png`: center display left,
+      cluster right).
+    - On Google's AAOS emulator the cluster is display 3, a private virtual
+      display (`ClusterOsDouble-VD`) that the ClusterOsDouble app draws onto
+      the physical cluster screen. Unity's task launched there without being
+      blocked, but GameActivity never got `APP_CMD_INIT_WINDOW`, so Unity
+      never had a surface. Not investigated further.
 
 ## Build
 
