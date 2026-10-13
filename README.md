@@ -878,6 +878,26 @@ Nine genuine, specific stories from this project, not generic claims:
     - Screenshots: `unity_plugin_dial_texture_vulkan.png`,
       `unity_plugin_dial_texture_gles.png` (overlay top left, texture panel
       above the car).
+  - **On an Android Automotive image (same evening).** Google's Android
+    Automotive emulator image (Android 15, arm64,
+    `system-images;android-35-ext15;android-automotive;arm64-v8a`) on the
+    Apple Silicon Mac, since Unity 6 only ships ARM64 for Android and the
+    self-built Cuttlefish image is x86_64. Unity picked GLES there. The app
+    subscribed to `PERF_VEHICLE_SPEED` through `CarPropertyManager`, and the
+    speed was set in the emulator's Vehicle HAL with `adb root` and `dumpsys
+    android.hardware.automotive.vehicle.IVehicle/default --set 0x11600207 -f
+    <m/s>`. 15 m/s showed as 54 km/h on both dials; changing it to 40 m/s
+    moved both needles to 144 km/h within 2 s with Unity in front
+    (`unity_plugin_aaos_54kmh.png`, `unity_plugin_aaos_144kmh.png`). So the
+    whole path runs on a car image: Vehicle HAL → Car Service →
+    `CarPropertyManager` → `TelemetryRouter` → JNI → Unity's render thread.
+    One fix on the way: the emulator's GLES rejects random-write RGBA8
+    textures ("format unsupported for random writes"), so the RenderTexture
+    asks for random writes only on Vulkan, which is the only path that needs
+    them. Like the Cuttlefish cockpit, this image has a private cluster
+    display (display 2) and a private `ClusterOsDouble-VD`. Not done here: Unity on
+    Vulkan in the emulator, and Unity on the self-built image (that needs an
+    arm64 car target such as `sdk_car_arm64`, built on the Ubuntu box).
 
 ## Build
 
