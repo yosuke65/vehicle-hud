@@ -1,13 +1,13 @@
 # Vehicle HUD
 
-A small native Android app built as prep for a Unity "Senior SWE, Embedded
-Android" interview (automotive Android/AOSP team) — a live vehicle-telemetry
+A small native Android app, built as a personal project to learn Android
+below the app layer on the automotive stack — a live vehicle-telemetry
 HUD rendered directly via EGL/OpenGL ES on its own thread, fed by synchronized
 C++ telemetry from two independent sources (an internal fake generator and an
-AIDL service running in a separate process). Built in 5 days around a
-full-time job. See the Claude Code plan file
-`~/.claude/plans/will-this-cover-aosp-sleepy-pebble.md` for the original
-week's design brief.
+AIDL service running in a separate process). The first version (Days 1–5 in
+the day-by-day log) took five days around a full-time job. The phases after
+it were added over the following weeks, ending with Phases 10–12 on
+2026-10-12 and 2026-10-13.
 
 ## Architecture
 
@@ -92,7 +92,7 @@ edits to the compositor and a Vehicle HAL, a Unity native plugin on that
 image's cluster, and a first Blueprint module — and here's specifically
 what's still untouched."*
 
-## Talking points for the interview
+## Talking points
 
 Specific stories from this project, not generic claims (1–12 from Phases
 1–10, 13–16 from Phases 11–12):
@@ -858,7 +858,8 @@ Specific stories from this project, not generic claims (1–12 from Phases
     separate thread, on both GLES and Vulkan. That's why plugin GPU work
     goes through `GL.IssuePluginEvent` and not a direct call from C#.
   - About 30 render events per second in both runs (300 every ~10 s). The
-    scene doesn't set `Application.targetFrameRate`.
+    scene doesn't set `Application.targetFrameRate`, so Unity runs at its
+    Android default of 30 fps (set to 60 in the 2026-10-14 batch, Phase 12).
   - Unity's batch build stops the adb server, so reconnect adb before
     installing.
   - **Drawing (added the same day).** The plugin draws a speed dial (7 ticks,
@@ -1043,7 +1044,8 @@ Specific stories from this project, not generic claims (1–12 from Phases
   - **GPU time per frame, from the GPU driver.** Perfetto's
     `gpu.renderstages` data source on the Pixel 6a (Mali-G78), after `adb
     shell setprop debug.graphics.gpu.profiler.perfetto 1`; the GPU counter
-    data source didn't register. 6 s traces:
+    data source didn't register. 6 s traces, config in
+    `tools/gpu_trace.pbtx`:
     - GLES HUD: per frame ~105 µs non-fragment (vertex/tiling) + ~122 µs
       fragment, so ~0.23 ms of GPU time at 60 fps.
     - Native Vulkan dial: ~95 µs + ~280 µs per frame, cycling through 4
@@ -1055,7 +1057,11 @@ Specific stories from this project, not generic claims (1–12 from Phases
     - Unity (Vulkan): one frame every ~33 ms, with a ~680 µs fragment pass on
       the swapchain image plus two jobs with no render target (~65–75 µs
       and ~315 µs); the plugin's compute dispatch is one of them, but the
-      trace doesn't say which. ~1.3 ms of GPU time per frame.
+      trace doesn't say which. ~1.3 ms of GPU time per frame. Re-measured
+      on 2026-10-14 with one query for both traces (every GPU stage on the
+      swapchain targets plus the jobs with no render target, divided by
+      frames): 1.21 ms per frame at 30 fps. The ~1.3 ms was a slightly
+      different sum.
     None of the three is GPU-bound; the earlier frame-pacing problem was on
     the CPU side.
   - **HWC and Gralloc on the self-built Cuttlefish.** With the `ranchu`
@@ -1127,6 +1133,130 @@ Specific stories from this project, not generic claims (1–12 from Phases
     - Long-press on the center display: Unity launched on cluster display 2
       and drew both dials at 90 km/h, the 25 m/s set in the Vehicle HAL
       (`unity_cluster_privapp_90kmh.png`).
+  - **Unity graphics-API batch (2026-10-14).** Unity rebuilds on the Pixel
+    6a (Vulkan), on vehicle-hud-unity branches `exp/unity-api-batch`
+    (`0498a39`, `3e42460`) and `exp/urp` (`3b3e93e`, `5953db0`,
+    `f5339f3`); master stays at `9feb398`. The first four items needed no
+    native change; the later ones changed `unity-plugin/hudgfx.cpp` here
+    (`45034b3`, `3694749`, `e171d02`, `1cfdb7e`).
+    - **60 fps.** `Application.targetFrameRate = 60` in `HudGfxBridge`'s
+      startup hook, to match the display. Plugin events went from 600 per
+      10 s to 600 per 5 s (two per frame), and SurfaceFlinger's frame-rate
+      vote for the app from 30 Hz to 60 Hz. GPU per Unity frame, same query
+      on both traces: 1.21 ms at 30.1 fps (178 frames in 5.9 s) and 1.35 ms
+      at 60.5 fps (265 frames in 4.4 s). The 60 fps build also had the
+      CommandBuffer change and was a development build.
+    - **CommandBuffer.** The overlay event (ID 1) is recorded once into a
+      CommandBuffer ("HudGfx overlay") added with
+      `Camera.main.AddCommandBuffer(CameraEvent.AfterForwardOpaque, cb)`, so
+      it runs after the opaque geometry and before transparents and UI. The
+      `WaitForEndOfFrame` path stays behind a const; the texture event (ID
+      2) is unchanged. No native change was needed: the same event ID keeps
+      `ConfigureEvent(EnsureInside)`, the pipeline cache is keyed by render
+      pass and subpass, depth-stencil state is zero, and MSAA is off.
+    - **Graphics Jobs** (`HUD_GFX_JOBS=1`, Native mode, one export). Unity's
+      log switched from `kGfxThreadingModeThreaded` to
+      `kGfxThreadingModeClientWorkerNativeJobs`. The plugin events still ran
+      on the single `UnityGfxDeviceWorker` thread, and the dial drew at 60
+      fps. The `gfx-threading-mode=4` line in boot.config was the same in
+      both builds. The shipped export keeps Graphics Jobs off.
+    - **Unity Profiler and Frame Debugger, without the Editor window.** A
+      development build (`HUD_DEV_BUILD=1`), `adb forward tcp:55000
+      localabstract:Unity-dev.yosukesakurai.vehiclehud`, and
+      `Assets/Editor/HudCapture.cs` in batch mode
+      (`ProfilerDriver.DirectIPConnect`, 10 s recording, then
+      `FrameDebuggerUtility` through reflection). Profiler, 592 frames: in a
+      16.7 ms frame the render thread spends 5.0 ms in `Camera.Render`
+      (4.2 ms of it in AcquireNextFrame), 0.019 ms in `HudGfx overlay`, and
+      10.8 ms in `Gfx.PresentFrame` (`GfxDeviceVK.Present` 9.3 ms); the
+      main thread waits 11.6 ms in `Gfx.WaitForPresentOnGfxThread`. So the
+      frame is bound by present and vsync, not by CPU render work. Frame
+      Debugger: 14 events; event 6 is `HudGfx overlay`, a PluginEvent right
+      after the opaque draws (1–5). The texture event runs outside camera
+      rendering, so it isn't in the list.
+    - **Gotchas.** Unity bundles adb 36 and the SDK has adb 37, and each
+      kills the other's server. The Editor's DirectIPConnect tries ports
+      55000–55063, 35000 and 4600, not 34999, so forward tcp:55000. The
+      Pixel asked for USB authorization after every adb restart, even with
+      "Always allow". While Unity runs, use Unity's own adb
+      (`.../PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb`). For a
+      plugin-only change, skip the Unity export: rebuild with `./build.sh`,
+      copy `libhudgfx.so` into
+      `Builds/AndroidExport/unityLibrary/src/main/jniLibs/arm64-v8a/`, then
+      run Gradle.
+    - **Unity ComputeShader** (`3e42460`).
+      `Assets/Resources/HudDialCompute.compute` is the plugin's `dial.comp`
+      ported to HLSL (`RWTexture2D<unorm float4>`, `[numthreads(8,8,1)]`). C#
+      loads it with `Resources.Load` and dispatches it every frame into a
+      random-write RenderTexture (32×32 groups); the needle is eased in C#
+      from `HudGfx_GetSpeedKph()`. Unity compiles the one HLSL source per API
+      (SPIR-V on Vulkan, GLSL ES 3.1 on GLES), where the plugin needs `glslc`
+      at build time plus runtime GLSL. Unity's texture row 0 is the bottom,
+      so the HLSL version needs no y flip; the plugin's version does. The
+      first version declared `RWTexture2D<float4>`, which compiled to an
+      Rgba32f SPIR-V image format against the RGBA8 view; the validation
+      layer (below) flagged it, and `unorm` fixed it (`f5339f3`).
+    - **CreateExternalTexture: the plugin owns the texture** (`3e42460`,
+      plugin `45034b3`). Event 3, on the render thread outside a render pass:
+      on Vulkan the plugin creates a 256×256 RGBA8 `VkImage` (STORAGE |
+      SAMPLED), allocates 262,144 bytes of device-local memory, binds it, and
+      records UNDEFINED → SHADER_READ_ONLY_OPTIMAL into Unity's command
+      buffer; on GLES it's a `glTexStorage2D` texture. C# then calls
+      `Texture2D.CreateExternalTexture(256, 256, RGBA32, false, true, ptr)`.
+      On Vulkan `ptr` is a `VkImage*`, so the handle sits at a stable address
+      in the plugin. Event 4 draws into it every frame with the compute
+      dial. AccessTexture on the wrapped texture returned the plugin's own
+      `VkImage` and reported usage 0x7 and layout UNDEFINED, which is what
+      Unity assumes for an external image, but it recorded no barrier. The
+      validation layer (below) showed the dispatch using the image as
+      GENERAL while it was really SHADER_READ_ONLY
+      (`VUID-vkCmdDispatch-imageLayout-00344`), and Unity's next barrier
+      starting from the wrong layout
+      (`VUID-VkImageMemoryBarrier-oldLayout-01197`). Fix (`1cfdb7e`): the
+      plugin owns that image, so it records SHADER_READ_ONLY → GENERAL →
+      SHADER_READ_ONLY around the dispatch itself and doesn't use
+      AccessTexture for it. There's now one
+      descriptor set per texture (a pool of 2), so drawing into two textures
+      never rewrites a set the GPU may still be reading. The image and its
+      memory are freed on the device's Shutdown event, after
+      `vkDeviceWaitIdle`.
+    - **URP and Render Graph** (branch `exp/urp`, `3b3e93e`; plugin
+      `3694749`). URP 17.5 with MSAA 1 and HDR off, set up in batch mode
+      (`UrpSetup.ConfigureAndExport`; the scene uses URP Lit).
+      `HudGfxRenderFeature` adds a `ScriptableRenderPass` at
+      `AfterRenderingOpaques`; its `RecordRenderGraph` adds an unsafe pass
+      with `UseTexture(activeColorTexture, ReadWrite)` and
+      `AllowPassCulling(false)` (its only output is in native code), and the
+      render function goes `CommandBufferHelpers.GetNativeCommandBuffer` →
+      `SetRenderTarget` → `IssuePluginEvent`. `Camera.AddCommandBuffer`
+      doesn't run under URP. Bug: the overlay came out upside down at the
+      bottom-left. The pass draws into URP's intermediate color texture, and
+      on Vulkan (`SystemInfo.graphicsUVStartsAtTop`) URP flips it on the
+      final blit. Fix: `HudGfx_SetOverlayTargetFlip(-1)` under URP. It runs
+      at 60 fps with all four dials.
+    - **URP with 4x MSAA, checked with the Vulkan validation layer**
+      (`e171d02`, `5953db0`). The overlay pipeline's `rasterizationSamples`
+      comes from `HudGfx_SetOverlaySamples`, and the pipeline cache key is
+      now (render pass, subpass, samples); the default is 1, so the
+      built-in path is unchanged. The URP pass reads
+      `renderGraph.GetTextureDesc(activeColorTexture).msaaSamples` (4 on the
+      phone) and passes it down before the plugin event. `adb shell setprop
+      debug.hudgfx.single_sample 1` forces the old 1-sample pipeline.
+      Checked with Khronos Vulkan-ValidationLayers 1.4.363.0 (official
+      Android binaries), copied into the debuggable app's data directory with
+      `run-as` and enabled with `settings put global
+      enable_gpu_debug_layers 1`, `gpu_debug_app dev.yosukesakurai.vehiclehud`
+      and `gpu_debug_layers VK_LAYER_KHRONOS_validation`; messages appear in
+      logcat under `VALIDATION`, and the settings were put back afterwards.
+      Forced 1 sample:
+      `VUID-VkGraphicsPipelineCreateInfo-multisampledRenderToSingleSampled-06853`
+      ("rasterizationSamples (1) does not match the number of samples of the RenderPass ... (4)") at
+      the plugin's pipeline creation, while the Mali driver still drew the
+      dial with no visible problem. Matched 4 samples: no error. After the
+      fixes above, nothing from this project's code; what's left is
+      Unity's own (a URP render pass with a 1-sample color and a 4-sample
+      depth attachment, 06872, and a swapchain semaphore reuse, 00067). The
+      plugin creates no render passes and submits nothing.
 
 ## Build
 
