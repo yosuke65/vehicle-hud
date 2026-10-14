@@ -23,6 +23,12 @@
 // - the needle follows the app's vehicle speed: Kotlin pushes it through JNI
 //   (UnityDialBridge.nativeSetSpeedKph) from its telemetry thread, and the
 //   render thread reads it from an atomic.
+// - event 3/4: a texture the plugin creates and owns. Event 3 creates it (a
+//   VkImage with its own memory, or a GL texture) and moves it to a sampled
+//   layout; C# wraps it with Texture2D.CreateExternalTexture and hands
+//   Unity's pointer back. Event 4 draws the dial into it every frame through
+//   the same path as event 2, so on Vulkan Unity's AccessTexture does the
+//   layout transitions for the plugin's own image too.
 // The dial layout lives in shaders/dial_body.glsl and is shared by every
 // path; the vertex paths build each vertex from its index, so there's no
 // vertex buffer, and the compute path draws the same layout per pixel.
@@ -52,6 +58,9 @@ namespace {
 
 constexpr int kOverlayEventId = 1;
 constexpr int kTextureEventId = 2;
+constexpr int kCreateExternalEventId = 3;
+constexpr int kExternalEventId = 4;
+constexpr int kExternalSize = 256;
 constexpr int kDialVertexCount = 7 * 6 + 3 + 6;  // matches kVertexCount in dial_body.glsl
 // Same full-scale speed as the native HUD's gauge (render_thread.cpp).
 constexpr float kMaxSpeedKph = 180.0f;
@@ -91,6 +100,11 @@ std::atomic<int> g_screenHeight{0};
 std::atomic<void*> g_dialTexture{nullptr};     // C#: RenderTexture.GetNativeTexturePtr()
 std::atomic<int> g_dialTextureWidth{0};
 std::atomic<int> g_dialTextureHeight{0};
+// The plugin-owned texture. g_externalNative is what C# passes to
+// CreateExternalTexture (a VkImage* on Vulkan, a GL name on GLES);
+// g_externalTexture is Unity's pointer for the wrapped texture, set back by C#.
+std::atomic<void*> g_externalNative{nullptr};
+std::atomic<void*> g_externalTexture{nullptr};
 
 const char* rendererName(UnityGfxRenderer renderer) {
     switch (renderer) {
@@ -293,11 +307,9 @@ void drawGlesOverlay(float value) {
     }
 }
 
-void drawGlesTexture(float value) {
+void drawGlesTexture(float value, std::atomic<void*>& target, int width, int height) {
     // On GLES, GetNativeTexturePtr() is the GL texture name.
-    const auto texture = static_cast<GLuint>(reinterpret_cast<uintptr_t>(g_dialTexture.load()));
-    const int width = g_dialTextureWidth.load();
-    const int height = g_dialTextureHeight.load();
+    const auto texture = static_cast<GLuint>(reinterpret_cast<uintptr_t>(target.load()));
     if (texture == 0 || width <= 0 || height <= 0 || !ensureGlesDial()) return;
     SavedGlState saved;
     saved.save();
@@ -309,7 +321,7 @@ void drawGlesTexture(float value) {
         if (status != GL_FRAMEBUFFER_COMPLETE) {
             LOGE("GLES dial FBO incomplete: 0x%x", status);
             saved.restore();
-            g_dialTexture.store(nullptr);
+            target.store(nullptr);
             return;
         }
         g_gles.fboTexture = texture;
@@ -326,6 +338,23 @@ void drawGlesTexture(float value) {
         LOGI("GLES texture dial drawn into texture %u through FBO %u, %dx%d, glGetError 0x%x", texture,
              g_gles.fbo, width, height, glGetError());
     }
+}
+
+// The plugin's own GL texture, made on the render thread (it owns the context).
+void createGlesExternal() {
+    if (g_externalNative.load() != nullptr) return;
+    GLint previous = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, kExternalSize, kExternalSize);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous));
+    g_externalNative.store(reinterpret_cast<void*>(static_cast<uintptr_t>(texture)));
+    LOGI("External texture created by the plugin: GL texture %u, %dx%d, glGetError 0x%x", texture, kExternalSize,
+         kExternalSize, glGetError());
 }
 
 // -------------------------------------------------------------- Vulkan path
@@ -356,6 +385,14 @@ struct VulkanDial {
     PFN_vkCmdSetViewport cmdSetViewport = nullptr;
     PFN_vkCmdSetScissor cmdSetScissor = nullptr;
     PFN_vkCmdDraw cmdDraw = nullptr;
+    PFN_vkCreateImage createImage = nullptr;
+    PFN_vkDestroyImage destroyImage = nullptr;
+    PFN_vkGetImageMemoryRequirements getImageMemoryRequirements = nullptr;
+    PFN_vkAllocateMemory allocateMemory = nullptr;
+    PFN_vkFreeMemory freeMemory = nullptr;
+    PFN_vkBindImageMemory bindImageMemory = nullptr;
+    PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
+    VkPhysicalDeviceMemoryProperties memoryProperties{};
     VkPipelineLayout layout = VK_NULL_HANDLE;
     // A pipeline is tied to a render pass (and compatible ones), and Unity
     // may draw the backbuffer with more than one, so cache one per pass.
@@ -366,9 +403,15 @@ struct VulkanDial {
     VkPipelineLayout computeLayout = VK_NULL_HANDLE;
     VkPipeline computePipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
-    VkImage boundImage = VK_NULL_HANDLE;
+    // One storage-image set per texture (Unity's RenderTexture and the
+    // plugin's own image), each written once, so drawing both every frame
+    // never rewrites a set the GPU may still be reading.
+    std::map<VkImage, VkDescriptorSet> descriptorSets;
     std::map<VkImage, VkImageView> textureViews;
+    // The plugin-owned image behind CreateExternalTexture. Unity takes a
+    // VkImage*, so the handle has to live at a stable address: here.
+    VkImage externalImage = VK_NULL_HANDLE;
+    VkDeviceMemory externalMemory = VK_NULL_HANDLE;
     bool failed = false;
     bool loggedOverlay = false;
     bool loggedTexture = false;
@@ -412,8 +455,19 @@ bool initVulkanDial(IUnityGraphicsVulkan* vulkan) {
               loadDeviceProc(getDeviceProcAddr, "vkCmdPushConstants", &g_vk.cmdPushConstants) &&
               loadDeviceProc(getDeviceProcAddr, "vkCmdSetViewport", &g_vk.cmdSetViewport) &&
               loadDeviceProc(getDeviceProcAddr, "vkCmdSetScissor", &g_vk.cmdSetScissor) &&
-              loadDeviceProc(getDeviceProcAddr, "vkCmdDraw", &g_vk.cmdDraw);
+              loadDeviceProc(getDeviceProcAddr, "vkCmdDraw", &g_vk.cmdDraw) &&
+              loadDeviceProc(getDeviceProcAddr, "vkCreateImage", &g_vk.createImage) &&
+              loadDeviceProc(getDeviceProcAddr, "vkDestroyImage", &g_vk.destroyImage) &&
+              loadDeviceProc(getDeviceProcAddr, "vkGetImageMemoryRequirements", &g_vk.getImageMemoryRequirements) &&
+              loadDeviceProc(getDeviceProcAddr, "vkAllocateMemory", &g_vk.allocateMemory) &&
+              loadDeviceProc(getDeviceProcAddr, "vkFreeMemory", &g_vk.freeMemory) &&
+              loadDeviceProc(getDeviceProcAddr, "vkBindImageMemory", &g_vk.bindImageMemory) &&
+              loadDeviceProc(getDeviceProcAddr, "vkCmdPipelineBarrier", &g_vk.cmdPipelineBarrier);
     if (!ok) return false;
+    auto getMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+            instance.getInstanceProcAddr(instance.instance, "vkGetPhysicalDeviceMemoryProperties"));
+    if (getMemoryProperties == nullptr) return false;
+    getMemoryProperties(instance.physicalDevice, &g_vk.memoryProperties);
 
     VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(DialParams)};
     VkPipelineLayoutCreateInfo layoutInfo{};
@@ -436,6 +490,10 @@ bool initVulkanDial(IUnityGraphicsVulkan* vulkan) {
     UnityVulkanPluginEventConfig texture = overlay;
     texture.renderPassPrecondition = kUnityVulkanRenderPass_EnsureOutside;
     vulkan->ConfigureEvent(kTextureEventId, &texture);
+    // Creating the plugin's image records a layout barrier, and drawing into
+    // it dispatches compute: both outside a render pass, like event 2.
+    vulkan->ConfigureEvent(kCreateExternalEventId, &texture);
+    vulkan->ConfigureEvent(kExternalEventId, &texture);
     return true;
 }
 
@@ -612,28 +670,22 @@ bool createVulkanCompute() {
     g_vk.destroyShaderModule(g_vk.device, comp, nullptr);
     if (result != VK_SUCCESS) return false;
 
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1};
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2};
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 1;
+    poolInfo.maxSets = 2;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
     if (g_vk.createDescriptorPool(g_vk.device, &poolInfo, nullptr, &g_vk.descriptorPool) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool = g_vk.descriptorPool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &g_vk.computeSetLayout;
-    if (g_vk.allocateDescriptorSets(g_vk.device, &allocInfo, &g_vk.descriptorSet) != VK_SUCCESS) return false;
     LOGI("Vulkan compute dial pipeline created");
     return true;
 }
 
-// Points the storage-image descriptor at this texture. Only done when the
-// texture changes, so a set the GPU may still be reading isn't rewritten
-// every frame.
-bool bindVulkanTexture(const UnityVulkanImage& image) {
-    if (g_vk.boundImage == image.image) return true;
+// The storage-image set for this texture, allocated and written the first
+// time the texture is seen and reused after that.
+VkDescriptorSet vulkanSetFor(const UnityVulkanImage& image) {
+    auto existing = g_vk.descriptorSets.find(image.image);
+    if (existing != g_vk.descriptorSets.end()) return existing->second;
     VkImageView view = VK_NULL_HANDLE;
     auto found = g_vk.textureViews.find(image.image);
     if (found != g_vk.textureViews.end()) {
@@ -645,28 +697,35 @@ bool bindVulkanTexture(const UnityVulkanImage& image) {
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
         viewInfo.format = image.format;
         viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        if (g_vk.createImageView(g_vk.device, &viewInfo, nullptr, &view) != VK_SUCCESS) return false;
+        if (g_vk.createImageView(g_vk.device, &viewInfo, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
         g_vk.textureViews[image.image] = view;
     }
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = g_vk.descriptorPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &g_vk.computeSetLayout;
+    if (g_vk.allocateDescriptorSets(g_vk.device, &allocInfo, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
     VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet write{};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = g_vk.descriptorSet;
+    write.dstSet = set;
     write.dstBinding = 0;
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     write.pImageInfo = &imageInfo;
     g_vk.updateDescriptorSets(g_vk.device, 1, &write, 0, nullptr);
-    g_vk.boundImage = image.image;
-    return true;
+    g_vk.descriptorSets[image.image] = set;
+    return set;
 }
 
-void drawVulkanTexture(float value) {
-    void* texture = g_dialTexture.load();
+void drawVulkanTexture(float value, std::atomic<void*>& target, bool& logged) {
+    void* texture = target.load();
     if (g_vk.failed || g_vk.unity == nullptr || texture == nullptr) return;
-    auto disable = [](const char* why) {
+    auto disable = [&target](const char* why) {
         LOGE("Texture dial disabled: %s", why);
-        g_dialTexture.store(nullptr);
+        target.store(nullptr);
     };
     if (g_vk.computePipeline == VK_NULL_HANDLE && !createVulkanCompute()) return disable("compute setup failed");
 
@@ -680,12 +739,16 @@ void drawVulkanTexture(float value) {
                                    kUnityVulkanResourceAccess_PipelineBarrier, &image)) {
         return disable("AccessTexture failed");
     }
-    if ((image.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0) {
+    // For the plugin's own image Unity only knows what CreateExternalTexture
+    // told it, so its usage field doesn't show the STORAGE bit the image was
+    // created with (seen on device: usage check failed for the wrapped image).
+    if ((image.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0 && image.image != g_vk.externalImage) {
         return disable("texture has no storage usage (RenderTexture.enableRandomWrite off?)");
     }
     UnityVulkanRecordingState state{};
     if (!g_vk.unity->CommandRecordingState(&state, kUnityVulkanGraphicsQueueAccess_DontCare)) return;
-    if (!bindVulkanTexture(image)) return disable("image view or descriptor update failed");
+    const VkDescriptorSet set = vulkanSetFor(image);
+    if (set == VK_NULL_HANDLE) return disable("image view or descriptor set failed");
 
     // Unity samples this texture with row 0 at the bottom, so draw it with
     // y flipped (seen on device: with 1.0 the dial came out upside down).
@@ -694,14 +757,14 @@ void drawVulkanTexture(float value) {
     const uint32_t height = image.extent.height;
     g_vk.cmdBindPipeline(state.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.computePipeline);
     g_vk.cmdBindDescriptorSets(state.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.computeLayout, 0, 1,
-                               &g_vk.descriptorSet, 0, nullptr);
+                               &set, 0, nullptr);
     g_vk.cmdPushConstants(state.commandBuffer, g_vk.computeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
                           &push);
     g_vk.cmdDispatch(state.commandBuffer, (width + kComputeGroupSize - 1) / kComputeGroupSize,
                      (height + kComputeGroupSize - 1) / kComputeGroupSize, 1);
 
-    if (!g_vk.loggedTexture) {
-        g_vk.loggedTexture = true;
+    if (!logged) {
+        logged = true;
         LOGI("Vulkan texture dial: AccessTexture gave VkImage %p, format %d, usage 0x%x, %ux%u, layout %d; "
              "dispatched %ux%u groups into Unity's command buffer (level %d, frame %llu)",
              reinterpret_cast<void*>(image.image), image.format, image.usage, width, height, image.layout,
@@ -710,9 +773,86 @@ void drawVulkanTexture(float value) {
     }
 }
 
+// Creates the plugin's own image: device-local memory, storage usage for the
+// compute dial and sampled usage for Unity's shaders. Its first barrier goes
+// into Unity's command buffer (UNDEFINED -> SHADER_READ_ONLY_OPTIMAL), so the
+// image is in a layout Unity can sample before Unity ever sees it.
+void createVulkanExternal() {
+    if (g_vk.failed || g_vk.unity == nullptr || g_vk.externalImage != VK_NULL_HANDLE) return;
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    info.extent = {kExternalSize, kExternalSize, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage image = VK_NULL_HANDLE;
+    if (g_vk.createImage(g_vk.device, &info, nullptr, &image) != VK_SUCCESS) {
+        LOGE("External texture: vkCreateImage failed");
+        return;
+    }
+    VkMemoryRequirements requirements{};
+    g_vk.getImageMemoryRequirements(g_vk.device, image, &requirements);
+    uint32_t typeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < g_vk.memoryProperties.memoryTypeCount; ++i) {
+        if ((requirements.memoryTypeBits & (1u << i)) &&
+            (g_vk.memoryProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            typeIndex = i;
+            break;
+        }
+    }
+    VkMemoryAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc.allocationSize = requirements.size;
+    alloc.memoryTypeIndex = typeIndex;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (typeIndex == UINT32_MAX || g_vk.allocateMemory(g_vk.device, &alloc, nullptr, &memory) != VK_SUCCESS ||
+        g_vk.bindImageMemory(g_vk.device, image, memory, 0) != VK_SUCCESS) {
+        LOGE("External texture: no device-local memory (type %u)", typeIndex);
+        if (memory != VK_NULL_HANDLE) g_vk.freeMemory(g_vk.device, memory, nullptr);
+        g_vk.destroyImage(g_vk.device, image, nullptr);
+        return;
+    }
+    UnityVulkanRecordingState state{};
+    if (!g_vk.unity->CommandRecordingState(&state, kUnityVulkanGraphicsQueueAccess_DontCare)) {
+        g_vk.destroyImage(g_vk.device, image, nullptr);
+        g_vk.freeMemory(g_vk.device, memory, nullptr);
+        return;
+    }
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    g_vk.cmdPipelineBarrier(state.commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    g_vk.externalImage = image;
+    g_vk.externalMemory = memory;
+    g_externalNative.store(&g_vk.externalImage);
+    LOGI("External texture created by the plugin: VkImage %p, %dx%d RGBA8, %llu bytes in memory type %u, "
+         "moved to SHADER_READ_ONLY_OPTIMAL in Unity's command buffer (frame %llu)",
+         reinterpret_cast<void*>(image), kExternalSize, kExternalSize,
+         static_cast<unsigned long long>(requirements.size), typeIndex,
+         static_cast<unsigned long long>(state.currentFrameNumber));
+}
+
 void destroyVulkanDial() {
     if (g_vk.device == VK_NULL_HANDLE) return;
     g_vk.deviceWaitIdle(g_vk.device);
+    if (g_vk.externalImage != VK_NULL_HANDLE) g_vk.destroyImage(g_vk.device, g_vk.externalImage, nullptr);
+    if (g_vk.externalMemory != VK_NULL_HANDLE) g_vk.freeMemory(g_vk.device, g_vk.externalMemory, nullptr);
+    g_externalNative.store(nullptr);
+    g_externalTexture.store(nullptr);
     for (auto& entry : g_vk.textureViews) g_vk.destroyImageView(g_vk.device, entry.second, nullptr);
     if (g_vk.descriptorPool != VK_NULL_HANDLE) g_vk.destroyDescriptorPool(g_vk.device, g_vk.descriptorPool, nullptr);
     if (g_vk.computePipeline != VK_NULL_HANDLE) g_vk.destroyPipeline(g_vk.device, g_vk.computePipeline, nullptr);
@@ -781,8 +921,15 @@ void UNITY_INTERFACE_API onRenderEvent(int eventId) {
         if (gles) drawGlesOverlay(value);
         if (vulkan) drawVulkanOverlay(value);
     } else if (eventId == kTextureEventId) {
-        if (gles) drawGlesTexture(value);
-        if (vulkan) drawVulkanTexture(value);
+        if (gles) drawGlesTexture(value, g_dialTexture, g_dialTextureWidth.load(), g_dialTextureHeight.load());
+        if (vulkan) drawVulkanTexture(value, g_dialTexture, g_vk.loggedTexture);
+    } else if (eventId == kCreateExternalEventId) {
+        if (gles) createGlesExternal();
+        if (vulkan) createVulkanExternal();
+    } else if (eventId == kExternalEventId) {
+        static bool loggedExternal = false;
+        if (gles) drawGlesTexture(value, g_externalTexture, kExternalSize, kExternalSize);
+        if (vulkan) drawVulkanTexture(value, g_externalTexture, loggedExternal);
     }
 }
 
@@ -827,6 +974,25 @@ extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API HudGfx_SetDialTexture
     g_dialTextureHeight.store(height);
     g_dialTexture.store(texture);
     LOGI("Dial texture set: %p, %dx%d", texture, width, height);
+}
+
+// The plugin-owned texture for Texture2D.CreateExternalTexture: null until
+// event 3 has run on the render thread. A VkImage* on Vulkan, a GL texture
+// name on GLES.
+extern "C" void* UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API HudGfx_GetExternalTexture() {
+    return g_externalNative.load();
+}
+
+// C# hands back the wrapped texture's GetNativeTexturePtr(), which is what
+// AccessTexture takes on Vulkan.
+extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API HudGfx_SetExternalTexture(void* texture) {
+    g_externalTexture.store(texture);
+    LOGI("External texture wrapped by Unity: %p", texture);
+}
+
+// The latest speed, for the Unity-side ComputeShader dial.
+extern "C" float UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API HudGfx_GetSpeedKph() {
+    return g_speedKph.load();
 }
 
 // Called by the host app's telemetry thread (TelemetryRouter ->
