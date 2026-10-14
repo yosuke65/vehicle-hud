@@ -26,9 +26,10 @@
 // - event 3/4: a texture the plugin creates and owns. Event 3 creates it (a
 //   VkImage with its own memory, or a GL texture) and moves it to a sampled
 //   layout; C# wraps it with Texture2D.CreateExternalTexture and hands
-//   Unity's pointer back. Event 4 draws the dial into it every frame through
-//   the same path as event 2, so on Vulkan Unity's AccessTexture does the
-//   layout transitions for the plugin's own image too.
+//   Unity's pointer back. Event 4 draws the dial into it every frame with the
+//   same compute shader; on Vulkan the plugin records the layout barriers
+//   itself (AccessTexture doesn't for an external image, see
+//   drawVulkanExternal).
 // The dial layout lives in shaders/dial_body.glsl and is shared by every
 // path; the vertex paths build each vertex from its index, so there's no
 // vertex buffer, and the compute path draws the same layout per pixel.
@@ -769,10 +770,7 @@ void drawVulkanTexture(float value, std::atomic<void*>& target, bool& logged) {
                                    kUnityVulkanResourceAccess_PipelineBarrier, &image)) {
         return disable("AccessTexture failed");
     }
-    // For the plugin's own image Unity only knows what CreateExternalTexture
-    // told it, so its usage field doesn't show the STORAGE bit the image was
-    // created with (seen on device: usage check failed for the wrapped image).
-    if ((image.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0 && image.image != g_vk.externalImage) {
+    if ((image.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0) {
         return disable("texture has no storage usage (RenderTexture.enableRandomWrite off?)");
     }
     UnityVulkanRecordingState state{};
@@ -876,6 +874,68 @@ void createVulkanExternal() {
          static_cast<unsigned long long>(state.currentFrameNumber));
 }
 
+// Draws into the plugin's own image. AccessTexture isn't used here: for a
+// texture made with CreateExternalTexture it reported layout UNDEFINED and
+// usage 0x7, updated Unity's own bookkeeping, but recorded no barrier, so the
+// validation layer saw the dispatch use GENERAL while the image was still
+// SHADER_READ_ONLY_OPTIMAL (VUID-vkCmdDispatch-imageLayout-00344), then a
+// barrier "from GENERAL" that didn't match (VUID-VkImageMemoryBarrier-
+// oldLayout-01197). The plugin owns this image, so it records both barriers
+// itself and always hands it back in SHADER_READ_ONLY_OPTIMAL, the layout it
+// was in when Unity wrapped it.
+void drawVulkanExternal(float value) {
+    if (g_vk.failed || g_vk.unity == nullptr || g_vk.externalImage == VK_NULL_HANDLE ||
+        g_externalTexture.load() == nullptr) {
+        return;
+    }
+    if (g_vk.computePipeline == VK_NULL_HANDLE && !createVulkanCompute()) return;
+    UnityVulkanImage image{};
+    image.image = g_vk.externalImage;
+    image.format = VK_FORMAT_R8G8B8A8_UNORM;
+    const VkDescriptorSet set = vulkanSetFor(image);
+    if (set == VK_NULL_HANDLE) return;
+    UnityVulkanRecordingState state{};
+    if (!g_vk.unity->CommandRecordingState(&state, kUnityVulkanGraphicsQueueAccess_DontCare)) return;
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = g_vk.externalImage;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // Last frame's sampling must finish before the compute shader overwrites
+    // every pixel; the old contents aren't needed, but the layout is known.
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    g_vk.cmdPipelineBarrier(state.commandBuffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    const ComputePush push{value, kTextureRadius, -1.0f};
+    const uint32_t groups = (kExternalSize + kComputeGroupSize - 1) / kComputeGroupSize;
+    g_vk.cmdBindPipeline(state.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.computePipeline);
+    g_vk.cmdBindDescriptorSets(state.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.computeLayout, 0, 1, &set,
+                               0, nullptr);
+    g_vk.cmdPushConstants(state.commandBuffer, g_vk.computeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                          &push);
+    g_vk.cmdDispatch(state.commandBuffer, groups, groups, 1);
+
+    // Back to the layout Unity samples it in.
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    g_vk.cmdPipelineBarrier(state.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LOGI("External texture dial: own barriers SHADER_READ_ONLY -> GENERAL -> SHADER_READ_ONLY around "
+             "%ux%u groups (frame %llu)", groups, groups, static_cast<unsigned long long>(state.currentFrameNumber));
+    }
+}
+
 void destroyVulkanDial() {
     if (g_vk.device == VK_NULL_HANDLE) return;
     g_vk.deviceWaitIdle(g_vk.device);
@@ -957,9 +1017,8 @@ void UNITY_INTERFACE_API onRenderEvent(int eventId) {
         if (gles) createGlesExternal();
         if (vulkan) createVulkanExternal();
     } else if (eventId == kExternalEventId) {
-        static bool loggedExternal = false;
         if (gles) drawGlesTexture(value, g_externalTexture, kExternalSize, kExternalSize);
-        if (vulkan) drawVulkanTexture(value, g_externalTexture, loggedExternal);
+        if (vulkan) drawVulkanExternal(value);
     }
 }
 
