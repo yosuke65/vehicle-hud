@@ -40,6 +40,7 @@
 #include <GLES3/gl3.h>
 #include <android/log.h>
 #include <jni.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -48,6 +49,7 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <tuple>
 #include <string>
 
 #define LOG_TAG "hudgfx"
@@ -109,6 +111,10 @@ std::atomic<void*> g_externalTexture{nullptr};
 // blits to the screen flipped (URP's intermediate color target on Vulkan;
 // seen on device: the dial came out upside down at the bottom). Set from C#.
 std::atomic<float> g_overlayTargetFlip{1.0f};
+// Sample count of the color target the overlay draws into. The pipeline's
+// rasterizationSamples must match the render pass it's used in, and Unity's
+// recording state doesn't say, so C# passes it (1 unless MSAA is on).
+std::atomic<int> g_overlaySamples{1};
 
 const char* rendererName(UnityGfxRenderer renderer) {
     switch (renderer) {
@@ -400,7 +406,9 @@ struct VulkanDial {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     // A pipeline is tied to a render pass (and compatible ones), and Unity
     // may draw the backbuffer with more than one, so cache one per pass.
-    std::map<std::pair<VkRenderPass, int>, VkPipeline> pipelines;
+    // Keyed by (render pass, subpass, samples): the same pass handle with a
+    // different sample count needs its own pipeline.
+    std::map<std::tuple<VkRenderPass, int, int>, VkPipeline> pipelines;
     // Compute path for drawing into a Unity texture: one storage-image
     // descriptor, pointed at the current texture's view.
     VkDescriptorSetLayout computeSetLayout = VK_NULL_HANDLE;
@@ -511,8 +519,24 @@ VkShaderModule createVulkanShader(const uint32_t* code, size_t size) {
     return module;
 }
 
-VkPipeline vulkanPipelineFor(VkRenderPass renderPass, int subpass) {
-    const auto key = std::make_pair(renderPass, subpass);
+// debug.hudgfx.single_sample=1 brings back the old 1-sample pipeline, to
+// show what a sample-count mismatch does on this GPU.
+bool forceSingleSample() {
+    char value[PROP_VALUE_MAX] = {};
+    return __system_property_get("debug.hudgfx.single_sample", value) > 0 && value[0] == '1';
+}
+
+VkSampleCountFlagBits sampleCountBits(int samples) {
+    switch (samples) {
+        case 2: return VK_SAMPLE_COUNT_2_BIT;
+        case 4: return VK_SAMPLE_COUNT_4_BIT;
+        case 8: return VK_SAMPLE_COUNT_8_BIT;
+        default: return VK_SAMPLE_COUNT_1_BIT;
+    }
+}
+
+VkPipeline vulkanPipelineFor(VkRenderPass renderPass, int subpass, int samples) {
+    const auto key = std::make_tuple(renderPass, subpass, samples);
     auto found = g_vk.pipelines.find(key);
     if (found != g_vk.pipelines.end()) return found->second;
 
@@ -545,11 +569,12 @@ VkPipeline vulkanPipelineFor(VkRenderPass renderPass, int subpass) {
         raster.cullMode = VK_CULL_MODE_NONE;
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         raster.lineWidth = 1.0f;
-        // The Android quality level has MSAA off, so Unity's backbuffer pass
-        // is single-sampled.
+        // Must match the sample count of the color attachment in Unity's
+        // current pass: 1 for the built-in pipeline here (MSAA off on the
+        // Android quality level), 4 under URP with 4x MSAA.
         VkPipelineMultisampleStateCreateInfo multisample{};
         multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisample.rasterizationSamples = sampleCountBits(samples);
         // Unity's pass may have a depth attachment; the dial ignores it.
         VkPipelineDepthStencilStateCreateInfo depth{};
         depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -587,8 +612,8 @@ VkPipeline vulkanPipelineFor(VkRenderPass renderPass, int subpass) {
             LOGE("vkCreateGraphicsPipelines failed: %d", result);
             pipeline = VK_NULL_HANDLE;
         } else {
-            LOGI("Vulkan dial pipeline created for render pass %p, subpass %d",
-                 reinterpret_cast<void*>(renderPass), subpass);
+            LOGI("Vulkan dial pipeline created for render pass %p, subpass %d, %d sample(s)",
+                 reinterpret_cast<void*>(renderPass), subpass, samples);
         }
     }
     if (vert != VK_NULL_HANDLE) g_vk.destroyShaderModule(g_vk.device, vert, nullptr);
@@ -617,7 +642,8 @@ void drawVulkanOverlay(float value) {
     UnityVulkanRecordingState state{};
     if (!g_vk.unity->CommandRecordingState(&state, kUnityVulkanGraphicsQueueAccess_DontCare)) return;
     if (state.renderPass == VK_NULL_HANDLE || state.subPassIndex < 0) return;
-    VkPipeline pipeline = vulkanPipelineFor(state.renderPass, state.subPassIndex);
+    const int samples = forceSingleSample() ? 1 : g_overlaySamples.load();
+    VkPipeline pipeline = vulkanPipelineFor(state.renderPass, state.subPassIndex, samples);
     if (pipeline == VK_NULL_HANDLE) {
         g_vk.failed = true;
         return;
@@ -998,6 +1024,11 @@ extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API HudGfx_SetExternalTex
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API HudGfx_SetOverlayTargetFlip(float flip) {
     g_overlayTargetFlip.store(flip);
     LOGI("Overlay target flip: %.0f", flip);
+}
+
+// The overlay target's sample count (MSAA), so the pipeline matches the pass.
+extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API HudGfx_SetOverlaySamples(int samples) {
+    if (g_overlaySamples.exchange(samples) != samples) LOGI("Overlay target samples: %d", samples);
 }
 
 // The latest speed, for the Unity-side ComputeShader dial.
