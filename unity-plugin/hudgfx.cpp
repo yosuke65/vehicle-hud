@@ -105,6 +105,10 @@ std::atomic<int> g_dialTextureHeight{0};
 // g_externalTexture is Unity's pointer for the wrapped texture, set back by C#.
 std::atomic<void*> g_externalNative{nullptr};
 std::atomic<void*> g_externalTexture{nullptr};
+// 1, or -1 when the overlay's target is a render texture that the pipeline
+// blits to the screen flipped (URP's intermediate color target on Vulkan;
+// seen on device: the dial came out upside down at the bottom). Set from C#.
+std::atomic<float> g_overlayTargetFlip{1.0f};
 
 const char* rendererName(UnityGfxRenderer renderer) {
     switch (renderer) {
@@ -298,7 +302,7 @@ void drawGlesOverlay(float value) {
     if (width <= 0 || height <= 0 || !ensureGlesDial()) return;
     SavedGlState saved;
     saved.save();
-    issueGlesDial(overlayParams(width, height, value, 1.0f), width, height);
+    issueGlesDial(overlayParams(width, height, value, g_overlayTargetFlip.load()), width, height);
     saved.restore();
     if (!g_gles.loggedOverlay) {
         g_gles.loggedOverlay = true;
@@ -619,7 +623,7 @@ void drawVulkanOverlay(float value) {
         return;
     }
     // Vulkan's NDC y points down, hence yFlip -1.
-    recordVulkanDial(state.commandBuffer, pipeline, overlayParams(width, height, value, -1.0f),
+    recordVulkanDial(state.commandBuffer, pipeline, overlayParams(width, height, value, -g_overlayTargetFlip.load()),
                      static_cast<uint32_t>(width), static_cast<uint32_t>(height));
     if (!g_vk.loggedOverlay) {
         g_vk.loggedOverlay = true;
@@ -988,6 +992,12 @@ extern "C" void* UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API HudGfx_GetExternalTe
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API HudGfx_SetExternalTexture(void* texture) {
     g_externalTexture.store(texture);
     LOGI("External texture wrapped by Unity: %p", texture);
+}
+
+// -1 when the overlay draws into a flipped intermediate target (URP).
+extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API HudGfx_SetOverlayTargetFlip(float flip) {
+    g_overlayTargetFlip.store(flip);
+    LOGI("Overlay target flip: %.0f", flip);
 }
 
 // The latest speed, for the Unity-side ComputeShader dial.
